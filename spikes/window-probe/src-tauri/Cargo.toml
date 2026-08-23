@@ -1,0 +1,15 @@
+[package]
+name = "codex-float-window-probe"
+version = "0.1.0"
+description = "Codex Float M0 transparent window probe"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

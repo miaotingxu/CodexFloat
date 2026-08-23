@@ -1,0 +1,36 @@
+# Node
+node_modules/
+dist/
+
+# Rust
+**/target/
+
+# Tauri generated/debug artifacts
+**/gen/schemas/
+*.pdb
+*.ilk
+
+# Local probes and generated runtime outputs
+artifacts/*-latest.json
+artifacts/app-server-schema/
+artifacts/window-probe-screenshot.png
+
+# Local databases and settings
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets and Codex private data
+.env
+.env.*
+auth.json
+**/.codex/
+*.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
