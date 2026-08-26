@@ -36,11 +36,6 @@ function App() {
   const [snapshot, setSnapshot] = useState(fallback);
   const [loading, setLoading] = useState(true);
   const [clickThrough, setClickThrough] = useState(false);
-  const dragMoved = useRef(false);
-  const dragOrigin = useRef<{ x: number; y: number } | null>(null);
-  const pressTimer = useRef<number | undefined>(undefined);
-  const suppressClick = useRef(false);
-  const dragPointerId = useRef<number | null>(null);
   const snapTimer = useRef<number | undefined>(undefined);
   const snapping = useRef(false);
 
@@ -100,55 +95,17 @@ function App() {
     };
   }, []);
 
-  const cancelPress = () => {
-    if (pressTimer.current !== undefined) {
-      window.clearTimeout(pressTimer.current);
-      pressTimer.current = undefined;
-    }
-  };
-
-  const beginDrag = (event: React.PointerEvent<HTMLElement>) => {
-    if (event.button !== 0 || dragPointerId.current !== null) return;
-    dragPointerId.current = event.pointerId;
-    dragMoved.current = false;
-    suppressClick.current = false;
-    dragOrigin.current = { x: event.clientX, y: event.clientY };
-    cancelPress();
-    pressTimer.current = window.setTimeout(() => {
-      dragMoved.current = true;
-      suppressClick.current = true;
-      void getCurrentWindow().startDragging().finally(() => {
-        dragPointerId.current = null;
-        dragOrigin.current = null;
-      });
-    }, 180);
-  };
-
-  const trackDrag = (event: React.PointerEvent<HTMLElement>) => {
-    if (dragPointerId.current !== event.pointerId) return;
-    const origin = dragOrigin.current;
-    if (!origin) return;
-    const distance = Math.hypot(event.clientX - origin.x, event.clientY - origin.y);
-    if (distance > 5) {
-      dragMoved.current = true;
-      suppressClick.current = true;
-      cancelPress();
-    }
-  };
-
-  const endDrag = () => {
-    cancelPress();
-    if (dragMoved.current) suppressClick.current = true;
-    dragPointerId.current = null;
-    dragOrigin.current = null;
+  const beginDrag = (event: React.MouseEvent<HTMLElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest("button, input, a, [data-no-drag]")) return;
+    event.preventDefault();
+    void getCurrentWindow().startDragging().catch((error) => {
+      console.error("Failed to start Codex Float dragging:", error);
+    });
   };
 
   const toggle = async () => {
-    if (suppressClick.current) {
-      suppressClick.current = false;
-      dragMoved.current = false;
-      return;
-    }
     const expanded = !snapshot.expanded;
     setSnapshot((current) => ({ ...current, expanded }));
     await invoke("set_window_expanded", { expanded }).catch(() => undefined);
@@ -161,10 +118,7 @@ function App() {
     <main className={snapshot.expanded ? "expanded" : "collapsed"}>
       <section
         className="compact-row drag-handle"
-        onPointerDown={beginDrag}
-        onPointerMove={trackDrag}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
+        onMouseDown={beginDrag}
         onClick={toggle}
       >
         <div className="brand-mark" aria-hidden="true">C</div>
@@ -183,10 +137,7 @@ function App() {
         <div className="details">
           <header
             className="drag-handle"
-            onPointerDown={beginDrag}
-            onPointerMove={trackDrag}
-            onPointerUp={endDrag}
-            onPointerCancel={endDrag}
+            onMouseDown={beginDrag}
             onClick={toggle}
           >
             <div>
