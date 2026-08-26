@@ -116,7 +116,11 @@ function App() {
     cancelPress();
     pressTimer.current = window.setTimeout(() => {
       dragMoved.current = true;
-      void getCurrentWindow().startDragging();
+      suppressClick.current = true;
+      void getCurrentWindow().startDragging().finally(() => {
+        dragPointerId.current = null;
+        dragOrigin.current = null;
+      });
     }, 180);
   };
 
@@ -183,6 +187,7 @@ function App() {
             onPointerMove={trackDrag}
             onPointerUp={endDrag}
             onPointerCancel={endDrag}
+            onClick={toggle}
           >
             <div>
               <b>Codex Float</b>
