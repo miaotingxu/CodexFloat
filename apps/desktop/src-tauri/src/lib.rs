@@ -255,21 +255,21 @@ fn resolve_codex_executable() -> PathBuf {
     if let Some(value) = std::env::var_os("CODEX_EXE") {
         candidates.push(PathBuf::from(value));
     }
+    candidates.push(PathBuf::from(
+        r"D:\nvm4w\nodejs\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
+    ));
     candidates.push(PathBuf::from(r"D:\nvm4w\nodejs\codex.cmd"));
     if let Some(root) = std::env::var_os("APPDATA").map(PathBuf::from) {
-        candidates.push(root.join("npm/codex.cmd"));
         candidates.push(
             root.join("npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64")
                 .join("vendor/x86_64-pc-windows-msvc/bin/codex.exe"),
         );
+        candidates.push(root.join("npm/codex.cmd"));
     }
-    candidates.push(PathBuf::from(
-        r"D:\nvm4w\nodejs\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe",
-    ));
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
-            candidates.push(directory.join("codex.cmd"));
             candidates.push(directory.join("codex.exe"));
+            candidates.push(directory.join("codex.cmd"));
         }
     }
     first_existing_path(candidates).unwrap_or_else(|| PathBuf::from("codex.cmd"))
@@ -330,7 +330,7 @@ fn read_rate_limits_uncached() -> (Vec<RateWindow>, String) {
         let _ = child.kill();
         return (vec![], "unavailable".into());
     }
-    let initialized = recv_response(&messages_rx, 1, Duration::from_secs(2))
+    let initialized = recv_response(&messages_rx, 1, Duration::from_secs(4))
         .is_some_and(|message| message.get("error").is_none());
     if !initialized {
         let _ = child.kill();
@@ -345,7 +345,7 @@ fn read_rate_limits_uncached() -> (Vec<RateWindow>, String) {
         return (vec![], "unavailable".into());
     }
 
-    let response = recv_response(&messages_rx, 2, Duration::from_secs(3));
+    let response = recv_response(&messages_rx, 2, Duration::from_secs(8));
     let _ = child.kill();
     let Some(response) = response else {
         return (vec![], "unavailable".into());
@@ -401,7 +401,7 @@ fn read_rate_limits(cache: &Mutex<Option<RateCache>>) -> (Vec<RateWindow>, Strin
     thread::spawn(move || {
         let _ = sender.send(read_rate_limits_uncached());
     });
-    if let Ok((windows, status)) = receiver.recv_timeout(Duration::from_secs(12)) {
+    if let Ok((windows, status)) = receiver.recv_timeout(Duration::from_secs(15)) {
         if status == "live" {
             let fetched_at = Local::now();
             if let Ok(mut slot) = cache.lock() {
