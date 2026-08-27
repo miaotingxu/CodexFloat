@@ -322,7 +322,8 @@ fn read_rate_limits_uncached() -> (Vec<RateWindow>, String) {
 
     if writeln!(
         input,
-        r#"{{"id":1,"method":"initialize","params":{{"clientInfo":{{"name":"codex-float","title":"Codex Float","version":"0.1.0"}}}}}}"#
+        "{}",
+        r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-float","title":"Codex Float","version":"0.1.0"}}}"#
     )
     .and_then(|_| input.flush())
     .is_err()
