@@ -8,11 +8,14 @@ export type RateWindow = {
 
 export function formatTokens(value: number): string {
   if (!Number.isFinite(value) || value < 0) return "0";
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
+  if (value >= 99_500_000 && value < 100_000_000) {
+    return "1亿";
   }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}K`;
+  if (value >= 100_000_000) {
+    return `${(value / 100_000_000).toFixed(value >= 1_000_000_000 ? 0 : 1).replace(/\.0$/, "")}亿`;
+  }
+  if (value >= 10_000) {
+    return `${(value / 10_000).toFixed(value >= 100_000 ? 0 : 1).replace(/\.0$/, "")}万`;
   }
   return Math.round(value).toLocaleString("zh-CN");
 }
