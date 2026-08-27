@@ -131,6 +131,13 @@ function App() {
           <strong>{formatTokens(snapshot.today)}</strong>
         </div>
         <span className={`status-dot ${snapshot.rateFreshness}`} title={snapshot.rateFreshness === "live" ? "额度实时" : snapshot.rateFreshness === "stale" ? "额度来自最近缓存" : "额度不可用"} />
+        <button
+          type="button"
+          className="toggle-button"
+          aria-label={snapshot.expanded ? "收起窗口" : "展开窗口"}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => { event.stopPropagation(); void toggle(); }}
+        >{snapshot.expanded ? "⌃" : "⌄"}</button>
       </section>
 
       {snapshot.expanded && (
@@ -144,7 +151,10 @@ function App() {
               <b>Codex Float</b>
               <span>本机状态</span>
             </div>
-            <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void refresh(); }}>刷新</button>
+            <div className="header-actions">
+              <button type="button" className="toggle-button" aria-label="收起窗口" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggle(); }}>收起</button>
+              <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void refresh(); }}>刷新</button>
+            </div>
           </header>
 
           <section className="quota-list">
