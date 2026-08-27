@@ -10,18 +10,19 @@ Codex Float 是一个面向 Windows 11 的本地优先 Codex 状态悬浮窗，�
 
 ## 当前阶段
 
-项目已完成 M1 核心 MVP 的首个可运行垂直切片。M0 技术验证与额度/Token 主链路已经闭环：
+项目已完成 M1 核心 MVP，并实现了多数 M2 窗口交互能力。目前定位为 **可运行的 Windows 内部 Alpha**：额度、Token、历史趋势、拖动、折叠、位置保存、托盘、鼠标穿透和全屏隐藏已进入正式运行路径；Provider 发布级容错、设置、完整 Windows 验收和安装发布仍在开发中。
 
-- 本地 app-server 额度读取已验证；
-- Codex Desktop 与 CLI/TUI 的本地 Token 事件已验证；
-- Tauri 2 透明置顶窗口已验证。
+当前事实基线与后续方案：
 
-详见：
+- `docs/PROJECT-STATUS.md`
+- `docs/plans/2026-08-26-m2-to-release.md`
+
+基础产品与历史验证文档：
 
 - `docs/PRD.md`
 - `docs/M0-TECHNICAL-VALIDATION.md`
-- `docs/M1-DEVELOPMENT-STATUS.md`
-- `docs/plans/2026-08-23-m1-core-mvp.md`
+- `docs/M1-DEVELOPMENT-STATUS.md`（历史快照）
+- `docs/plans/2026-08-23-m1-core-mvp.md`（历史计划）
 
 ## 开发运行
 
