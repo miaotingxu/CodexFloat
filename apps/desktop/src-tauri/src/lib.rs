@@ -36,6 +36,7 @@ pub struct Snapshot {
     pub rate_freshness: String,
     pub token_coverage: String,
     pub usage_source: String,
+    pub today_available: bool,
     pub updated_at: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -829,34 +830,37 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         )
     };
     let account_daily = read_account_usage_uncached();
-    let (today, last7, last30, daily, usage_source, token_coverage) = match account_daily {
-        Some(daily) => {
-            let (today, last7, last30) = usage_totals(&daily, local_today);
-            let today_key = Local::now().date_naive().to_string();
-            let has_account_today = daily.iter().any(|point| point.day == today_key);
-            let source = if has_account_today {
-                "account"
-            } else {
-                "account_history_local_today"
-            };
-            (
-                today,
-                last7,
-                last30,
-                daily,
-                source.to_string(),
-                "account".to_string(),
-            )
-        }
-        None => (
-            local_today,
-            local_last7,
-            local_last30,
-            local_daily,
-            "local".to_string(),
-            token_coverage.to_string(),
-        ),
-    };
+    let (today, last7, last30, daily, usage_source, token_coverage, today_available) =
+        match account_daily {
+            Some(daily) => {
+                let (today, last7, last30) = usage_totals(&daily, local_today);
+                let today_key = Local::now().date_naive().to_string();
+                let has_account_today = daily.iter().any(|point| point.day == today_key);
+                let source = if has_account_today {
+                    "account"
+                } else {
+                    "account_history_pending_today"
+                };
+                (
+                    today,
+                    last7,
+                    last30,
+                    daily,
+                    source.to_string(),
+                    "account".to_string(),
+                    has_account_today,
+                )
+            }
+            None => (
+                local_today,
+                local_last7,
+                local_last30,
+                local_daily,
+                "local".to_string(),
+                token_coverage.to_string(),
+                true,
+            ),
+        };
     let expanded = *state.expanded.lock().unwrap();
     let (windows, status, freshness, rate_updated_at) = read_rate_limits(&state.rate_cache);
     Snapshot {
@@ -871,6 +875,7 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         rate_freshness: freshness,
         token_coverage: token_coverage.into(),
         usage_source,
+        today_available,
         updated_at: if rate_updated_at.is_empty() {
             Local::now().to_rfc3339()
         } else {
