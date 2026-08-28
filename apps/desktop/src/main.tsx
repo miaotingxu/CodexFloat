@@ -11,7 +11,7 @@ type Snapshot = {
   today: number;
   last7: number;
   last30: number;
-  daily: number[];
+  daily: { day: string; tokens: number }[];
   windows: RateWindow[];
   rateStatus: "live" | "stale" | "unavailable";
   rateFreshness: "live" | "stale" | "unavailable";
@@ -112,7 +112,7 @@ function App() {
   };
 
   const primary = snapshot.windows[0];
-  const maxDay = useMemo(() => Math.max(...snapshot.daily, 1), [snapshot.daily]);
+  const maxDay = useMemo(() => Math.max(...snapshot.daily.map((point) => point.tokens), 1), [snapshot.daily]);
 
   return (
     <main className={snapshot.expanded ? "expanded" : "collapsed"}>
@@ -176,8 +176,8 @@ function App() {
 
           <section className="trend">
             <div className="bars">
-              {snapshot.daily.slice(-7).map((tokens, index) => (
-                <div className="bar-item" key={index} title={`${formatTokens(tokens)} Token`}><i style={{ height: `${Math.max(7, tokens / maxDay * 100)}%` }} /><small>{formatTokens(tokens)}</small></div>
+              {snapshot.daily.slice(-7).map((point) => (
+                <div className="bar-item" key={point.day} title={`${point.day} · ${formatTokens(point.tokens)} Token`}><i style={{ height: `${Math.max(7, point.tokens / maxDay * 100)}%` }} /><small className="bar-day">{point.day.slice(5).replace("-", "/")}</small><small>{formatTokens(point.tokens)}</small></div>
               ))}
             </div>
           </section>

@@ -28,12 +28,18 @@ pub struct Snapshot {
     pub today: i64,
     pub last7: i64,
     pub last30: i64,
-    pub daily: Vec<i64>,
+    pub daily: Vec<DailyPoint>,
     pub windows: Vec<RateWindow>,
     pub rate_status: String,
     pub rate_freshness: String,
     pub token_coverage: String,
     pub updated_at: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyPoint {
+    pub day: String,
+    pub tokens: i64,
 }
 #[derive(Debug, Deserialize)]
 struct TokenInfo {
@@ -217,7 +223,7 @@ fn sums(c: &Connection, days: i64) -> rusqlite::Result<i64> {
         |r| r.get(0),
     )
 }
-fn series(c: &Connection) -> rusqlite::Result<Vec<i64>> {
+fn series(c: &Connection) -> rusqlite::Result<Vec<DailyPoint>> {
     let today = Local::now().date_naive();
     (0..7)
         .rev()
@@ -225,8 +231,13 @@ fn series(c: &Connection) -> rusqlite::Result<Vec<i64>> {
             let d = (today - chrono::Days::new(i)).to_string();
             c.query_row(
                 "SELECT COALESCE(tokens,0) FROM daily WHERE day=?",
-                [d],
-                |r| r.get(0),
+                [&d],
+                |r| {
+                    Ok(DailyPoint {
+                        day: d.clone(),
+                        tokens: r.get(0)?,
+                    })
+                },
             )
         })
         .collect()

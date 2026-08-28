@@ -59,11 +59,12 @@ header button:not(.toggle-button) { border: 0; border-radius: 9px; padding: 5px 
 .totals div { padding: 7px 8px; border-radius: 11px; background: rgba(255,255,255,.035); }
 .totals small, .totals strong { display: block; }
 .totals strong { margin-top: 2px; font-size: 16px; }
-.trend { height: 72px; margin-top: 8px; }
+.trend { height: 84px; margin-top: 8px; }
 .bars { height: 100%; display: flex; align-items: stretch; gap: 6px; padding: 0 5px; }
-.bar-item { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 3px; }
+.bar-item { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; }
 .bar-item i { display: block; width: 100%; min-height: 4px; border-radius: 4px 4px 2px 2px; background: linear-gradient(180deg,#67dfaf,#477fc5); opacity: .84; }
 .bar-item small { overflow: hidden; color: #8f9bad; font-size: 8px; line-height: 10px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.bar-item .bar-day { color: #697689; font-size: 7px; }
 footer { display: flex; justify-content: space-between; margin-top: auto; color: #778397; font-size: 9px; }
 .footer-actions { display: inline-flex; align-items: center; gap: 6px; }
 .footer-actions button { border: 0; padding: 0; color: #8f9bae; background: transparent; cursor: pointer; font-size: 9px; }
