@@ -133,11 +133,12 @@ function App() {
         <span className={`status-dot ${snapshot.rateFreshness}`} title={snapshot.rateFreshness === "live" ? "额度实时" : snapshot.rateFreshness === "stale" ? "额度来自最近缓存" : "额度不可用"} />
         <button
           type="button"
-          className="toggle-button"
+          className="toggle-button compact-toggle"
           aria-label={snapshot.expanded ? "收起窗口" : "展开窗口"}
+          title="展开详情"
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => { event.stopPropagation(); void toggle(); }}
-        >{snapshot.expanded ? "⌃" : "⌄"}</button>
+        ><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg></button>
       </section>
 
       {snapshot.expanded && (
@@ -152,7 +153,7 @@ function App() {
               <span>本机状态</span>
             </div>
             <div className="header-actions">
-              <button type="button" className="toggle-button" aria-label="收起窗口" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggle(); }}>收起</button>
+              <button type="button" className="toggle-button panel-toggle" aria-label="收起窗口" title="收起窗口" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggle(); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" /></svg></button>
               <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void refresh(); }}>刷新</button>
             </div>
           </header>
