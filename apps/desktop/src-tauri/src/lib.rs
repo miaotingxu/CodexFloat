@@ -48,7 +48,6 @@ pub struct DailyPoint {
 #[derive(Debug, Deserialize)]
 struct TokenInfo {
     total_token_usage: Option<TotalUsage>,
-    last_token_usage: Option<TotalUsage>,
 }
 #[derive(Debug, Deserialize)]
 struct TotalUsage {
@@ -190,14 +189,8 @@ fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
         let Some(total) = info.total_token_usage.and_then(|x| x.total_tokens) else {
             continue;
         };
-        let increment = info
-            .last_token_usage
-            .and_then(|x| x.total_tokens)
-            .unwrap_or(0);
         let delta = if total == previous {
             0
-        } else if increment > 0 {
-            increment
         } else if total < previous {
             total.max(0)
         } else {
@@ -217,6 +210,7 @@ fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
 }
 pub fn scan_sessions(c: &Connection, root: &Path) -> rusqlite::Result<usize> {
     cleanup_old_daily(c, 30)?;
+    c.execute_batch("DELETE FROM events; DELETE FROM daily; DELETE FROM cursors;")?;
     let mut n = 0;
     if !root.exists() {
         return Ok(0);
@@ -815,7 +809,7 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_default()
         .join(".codex/sessions");
-    let (token_coverage, local_today, local_last7, local_last30, local_daily) = {
+    let (token_coverage, today, last7, last30, daily) = {
         let db = state.db.lock().unwrap();
         let coverage = match scan_sessions(&db, &home) {
             Ok(_) => "partial",
@@ -829,38 +823,8 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
             series(&db).unwrap_or_default(),
         )
     };
-    let account_daily = read_account_usage_uncached();
-    let (today, last7, last30, daily, usage_source, token_coverage, today_available) =
-        match account_daily {
-            Some(daily) => {
-                let (today, last7, last30) = usage_totals(&daily, local_today);
-                let today_key = Local::now().date_naive().to_string();
-                let has_account_today = daily.iter().any(|point| point.day == today_key);
-                let source = if has_account_today {
-                    "account"
-                } else {
-                    "account_history_pending_today"
-                };
-                (
-                    today,
-                    last7,
-                    last30,
-                    daily,
-                    source.to_string(),
-                    "account".to_string(),
-                    has_account_today,
-                )
-            }
-            None => (
-                local_today,
-                local_last7,
-                local_last30,
-                local_daily,
-                "local".to_string(),
-                token_coverage.to_string(),
-                true,
-            ),
-        };
+    let usage_source = "local".to_string();
+    let today_available = true;
     let expanded = *state.expanded.lock().unwrap();
     let (windows, status, freshness, rate_updated_at) = read_rate_limits(&state.rate_cache);
     Snapshot {
@@ -1156,6 +1120,23 @@ mod tests {
     }
     fn line_at(total: i64, inc: i64, timestamp: &str) -> String {
         serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total},"last_token_usage":{"total_tokens":inc}}}}).to_string()
+    }
+    #[test]
+    fn aggregation_uses_cumulative_total_not_last_snapshot_field() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("a.jsonl");
+        fs::write(
+            &p,
+            format!(
+                "{}\n{}\n",
+                line_at(100, 100, "2026-08-10T10:00:00Z"),
+                line_at(150, 999, "2026-08-10T10:01:00Z")
+            ),
+        )
+        .unwrap();
+        let c = db();
+        scan_file(&c, &p).unwrap();
+        assert_eq!(sums(&c, 30).unwrap(), 150);
     }
     #[test]
     fn duplicate_snapshot_is_idempotent() {
