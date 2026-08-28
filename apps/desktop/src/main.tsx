@@ -154,7 +154,7 @@ function App() {
             </div>
             <div className="header-actions">
               <button type="button" className="toggle-button panel-toggle" aria-label="收起窗口" title="收起窗口" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggle(); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" /></svg></button>
-              <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void refresh(); }}>刷新</button>
+              <button type="button" className="refresh-button" aria-label="刷新数据" title="刷新数据" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void refresh(); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5V2.8L11.2 4.6A5 5 0 1 0 12.8 10" /></svg></button>
             </div>
           </header>
 
@@ -177,7 +177,7 @@ function App() {
           <section className="trend">
             <div className="bars">
               {snapshot.daily.slice(-7).map((tokens, index) => (
-                <i key={index} title={formatTokens(tokens)} style={{ height: `${Math.max(7, tokens / maxDay * 100)}%` }} />
+                <div className="bar-item" key={index} title={`${formatTokens(tokens)} Token`}><i style={{ height: `${Math.max(7, tokens / maxDay * 100)}%` }} /><small>{formatTokens(tokens)}</small></div>
               ))}
             </div>
           </section>
