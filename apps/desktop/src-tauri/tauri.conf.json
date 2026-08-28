@@ -12,6 +12,18 @@
     "windows": [
       {
         "label": "main",
+        "title": "Codex Float · 主窗口",
+        "width": 920,
+        "height": 620,
+        "minWidth": 760,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
+      },
+      {
+        "label": "float",
         "title": "Codex Float",
         "width": 250,
         "height": 64,

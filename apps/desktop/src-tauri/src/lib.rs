@@ -790,7 +790,7 @@ fn set_window_expanded(
             .map_err(|e| e.to_string())?;
     }
     use tauri::Manager;
-    if let Some(w) = app.get_webview_window("main") {
+    if let Some(w) = app.get_webview_window("float") {
         w.set_size(tauri::LogicalSize::new(
             if expanded { 320.0 } else { 250.0 },
             if expanded { 280.0 } else { 64.0 },
@@ -861,7 +861,7 @@ fn start_fullscreen_monitor(app: tauri::AppHandle) {
                     fullscreen = got_monitor && got_window && window_rect == info.rcMonitor;
                 }
             }
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window("float") {
                 if fullscreen && !hidden {
                     let _ = window.hide();
                     hidden = true;
@@ -905,7 +905,7 @@ pub fn run() {
                                     *enabled
                                 });
                                 if let Some(enabled) = next {
-                                    if let Some(window) = app.get_webview_window("main") {
+                                    if let Some(window) = app.get_webview_window("float") {
                                         let _ = window.set_ignore_cursor_events(enabled);
                                     }
                                     let _ = app.emit("click-through-changed", enabled);
@@ -919,14 +919,23 @@ pub fn run() {
             {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::TrayIconBuilder;
-                let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+                let show_main =
+                    MenuItem::with_id(app, "show-main", "打开主窗口", true, None::<&str>)?;
+                let show_float =
+                    MenuItem::with_id(app, "show-float", "显示悬浮窗", true, None::<&str>)?;
                 let quit = MenuItem::with_id(app, "quit", "退出 Codex Float", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&show, &quit])?;
+                let menu = Menu::with_items(app, &[&show_main, &show_float, &quit])?;
                 TrayIconBuilder::new()
                     .menu(&menu)
                     .on_menu_event(|app, event| match event.id.as_ref() {
-                        "show" => {
+                        "show-main" => {
                             if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "show-float" => {
+                            if let Some(window) = app.get_webview_window("float") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
@@ -951,7 +960,7 @@ pub fn run() {
                 )
                 .ok()
             });
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window("float") {
                 let expanded = saved.as_ref().map(|value| value.2).unwrap_or(false);
                 if expanded {
                     window.set_size(tauri::LogicalSize::new(320.0, 300.0))?;

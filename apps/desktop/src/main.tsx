@@ -42,7 +42,7 @@ const fallback: Snapshot = {
   updatedAt: "",
 };
 
-function App() {
+function FloatApp() {
   const [snapshot, setSnapshot] = useState(fallback);
   const [loading, setLoading] = useState(true);
   const [clickThrough, setClickThrough] = useState(false);
@@ -230,4 +230,54 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+function MainWindow() {
+  const [snapshot, setSnapshot] = useState(fallback);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      setSnapshot(await invoke<Snapshot>("get_dashboard_snapshot"));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 120_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  const primary = snapshot.windows[0];
+  const account = snapshot.account;
+  const subscription = account.subscriptionActiveUntil
+    ? new Date(account.subscriptionActiveUntil).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" })
+    : "暂不可用";
+  const statusText = account.bound ? (account.subscriptionState === "active" ? "账号正常" : account.subscriptionState === "unknown" ? "日期待确认" : "订阅需关注") : "未绑定账号";
+
+  return (
+    <main className="dashboard-shell">
+      <header className="dashboard-titlebar" data-no-drag>
+        <div className="dashboard-brand"><div className="brand-mark">C</div><div><b>Codex Float</b><span>账号与用量中心</span></div></div>
+        <div className="window-actions"><button aria-label="最小化" onClick={() => void getCurrentWindow().minimize()}>−</button><button aria-label="关闭主窗口" onClick={() => void getCurrentWindow().close()}>×</button></div>
+      </header>
+      <div className="dashboard-content">
+        <section className="hero-card">
+          <div><span className="eyebrow">当前账号</span><h1>{account.email ?? "未绑定 Codex 账号"}</h1><p>{account.planType ? `${account.planType} 方案 · ` : ""}{statusText}</p></div>
+          <button className="dashboard-refresh" onClick={() => void refresh()} disabled={loading} aria-label="刷新数据">↻</button>
+        </section>
+        <section className="dashboard-grid">
+          <article className="dashboard-card quota-hero"><div className="card-heading"><span>实时额度</span><i className={`live-indicator ${snapshot.rateFreshness}`} /></div><strong>{primary ? `${Math.round(primary.remainingPercent ?? 0)}%` : "--"}</strong><div className="large-progress"><i style={{ width: `${Math.max(0, Math.min(100, primary?.remainingPercent ?? 0))}%` }} /></div><small>{primary?.label ?? "额度暂不可用"} · {primary ? formatReset(primary.resetsAt) : "等待数据"}</small></article>
+          <article className="dashboard-card"><div className="card-heading"><span>订阅到期</span><span className={`badge ${account.subscriptionState}`}>{account.bound ? "已绑定" : "未绑定"}</span></div><strong className="date-value">{subscription}</strong><small>{account.subscriptionError ?? (account.checkedAt ? `最近检查 ${new Date(account.checkedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}` : "等待检查")}</small></article>
+          <article className="dashboard-card"><div className="card-heading"><span>今日 Token</span><span className="muted-label">本机可观测</span></div><strong>{formatTokens(snapshot.today)}</strong><small>最近 7 天 {formatTokens(snapshot.last7)}</small></article>
+        </section>
+        <section className="dashboard-card usage-card"><div className="section-heading"><div><span className="eyebrow">Usage trend</span><h2>Token 使用趋势</h2></div><span className="muted-label">最近 7 天</span></div><div className="dashboard-bars">{snapshot.daily.slice(-7).map((point) => { const max = Math.max(...snapshot.daily.map((item) => item.tokens), 1); return <div className="dashboard-bar" key={point.day}><i style={{ height: `${Math.max(8, point.tokens / max * 100)}%` }} /><small>{point.day.slice(5).replace("-", "/")}</small><b>{formatTokens(point.tokens)}</b></div>; })}</div></section>
+        <section className="dashboard-card windows-card"><div className="section-heading"><div><span className="eyebrow">Quota windows</span><h2>额度窗口</h2></div><span className={`badge ${snapshot.rateFreshness}`}>{snapshot.rateFreshness === "live" ? "实时" : snapshot.rateFreshness === "stale" ? "缓存" : "不可用"}</span></div><div className="window-list">{snapshot.windows.map((item, index) => <div className="window-row" key={`${item.label}-${index}`}><span>{formatWindow(item)}</span><b>{Math.round(item.remainingPercent ?? 0)}%</b><small>{formatReset(item.resetsAt)}</small></div>)}</div></section>
+      </div>
+      <div className="dashboard-corner-badge"><i />{account.bound ? "实时同步" : "等待绑定"}</div>
+    </main>
+  );
+}
+
+const Root = getCurrentWindow().label === "main" ? MainWindow : FloatApp;
+createRoot(document.getElementById("root")!).render(<Root />);
