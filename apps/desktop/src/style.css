@@ -45,6 +45,14 @@ header { display: flex; align-items: center; justify-content: space-between; }
 header div { display: flex; align-items: baseline; gap: 8px; }
 header b { font-size: 14px; }
 header span { color: #7f8a9c; font-size: 10px; }
+header .header-account { min-width: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; margin-left: auto; margin-right: 8px; }
+header .header-account strong { max-width: 132px; overflow: hidden; color: #cbd5e1; font-size: 10px; font-weight: 600; text-overflow: ellipsis; }
+header .header-account .subscription { max-width: 170px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; }
+header .header-account .subscription.active { color: #72e3ac; }
+header .header-account .subscription.within_30d { color: #d5e36b; }
+header .header-account .subscription.within_7d, header .header-account .subscription.within_24h { color: #ffb454; }
+header .header-account .subscription.expired { color: #ff6d73; }
+header .header-account .subscription.unknown { color: #8995a6; }
 header button:not(.toggle-button) { border: 0; border-radius: 9px; padding: 5px 9px; color: #aeb8c7; background: rgba(255,255,255,.06); cursor: pointer; }
 .refresh-button { display: inline-grid; place-items: center; width: 30px; height: 30px; padding: 0 !important; }
 .refresh-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }

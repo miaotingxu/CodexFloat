@@ -1,4 +1,5 @@
-use chrono::{DateTime, Local};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +31,7 @@ pub struct Snapshot {
     pub last30: i64,
     pub daily: Vec<DailyPoint>,
     pub windows: Vec<RateWindow>,
+    pub account: AccountStatus,
     pub rate_status: String,
     pub rate_freshness: String,
     pub token_coverage: String,
@@ -64,6 +66,25 @@ struct EventLine {
     payload: Option<LinePayload>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub bound: bool,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub subscription_active_until: Option<String>,
+    pub subscription_state: String,
+    pub subscription_error: Option<String>,
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AccountCache {
+    cache_key: String,
+    status: AccountStatus,
+    fetched_at: DateTime<Local>,
+}
+
 struct RateCache {
     windows: Vec<RateWindow>,
     fetched_at: DateTime<Local>,
@@ -74,6 +95,7 @@ pub struct Store {
     pub expanded: Mutex<bool>,
     pub click_through: Mutex<bool>,
     rate_cache: Mutex<Option<RateCache>>,
+    account_cache: Mutex<Option<AccountCache>>,
 }
 impl Store {
     pub fn new(path: &Path) -> rusqlite::Result<Self> {
@@ -90,6 +112,7 @@ impl Store {
             expanded: Mutex::new(expanded),
             click_through: Mutex::new(false),
             rate_cache: Mutex::new(None),
+            account_cache: Mutex::new(None),
         })
     }
 }
@@ -214,6 +237,264 @@ pub fn scan_sessions(c: &Connection, root: &Path) -> rusqlite::Result<usize> {
     walk(c, root, &mut n)?;
     Ok(n)
 }
+
+const SUBSCRIPTION_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
+const SUBSCRIPTIONS_URL: &str = "https://chatgpt.com/backend-api/subscriptions";
+const ACCOUNT_CACHE_MAX_AGE_SECS: i64 = 30 * 60;
+
+fn auth_file_path() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".codex")))
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+        .join("auth.json")
+}
+
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let part = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(part).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn find_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    if let Some(object) = value.as_object() {
+        for key in keys {
+            if let Some(found) = json_string(object.get(*key)) {
+                return Some(found);
+            }
+        }
+        for child in object.values() {
+            if let Some(found) = find_key(child, keys) {
+                return Some(found);
+            }
+        }
+    } else if let Some(array) = value.as_array() {
+        for child in array {
+            if let Some(found) = find_key(child, keys) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn subscription_state(date: Option<&str>) -> String {
+    let Some(raw) = date else {
+        return "unknown".into();
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|value| value.with_timezone(&Utc));
+    let Some(parsed) = parsed else {
+        return "unknown".into();
+    };
+    let diff = parsed.signed_duration_since(Utc::now());
+    if diff.num_seconds() <= 0 {
+        "expired".into()
+    } else if diff.num_hours() < 24 {
+        "within_24h".into()
+    } else if diff.num_days() < 7 {
+        "within_7d".into()
+    } else if diff.num_days() < 30 {
+        "within_30d".into()
+    } else {
+        "active".into()
+    }
+}
+
+fn auth_identity() -> Result<(String, String, Option<String>, Option<String>), String> {
+    let raw = fs::read_to_string(auth_file_path())
+        .map_err(|e| format!("读取 Codex 登录文件失败: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 Codex 登录文件失败: {e}"))?;
+    let tokens = value.get("tokens").ok_or("Codex 登录文件没有 tokens")?;
+    let access =
+        json_string(tokens.get("access_token")).ok_or("Codex 登录文件没有 access_token")?;
+    let id_token = json_string(tokens.get("id_token")).unwrap_or_default();
+    let payload = decode_jwt_payload(&id_token)
+        .or_else(|| decode_jwt_payload(&access))
+        .unwrap_or(serde_json::Value::Null);
+    let auth = payload.get("https://api.openai.com/auth");
+    let email = json_string(payload.get("email"))
+        .or_else(|| auth.and_then(|v| json_string(v.get("email"))))
+        .unwrap_or_else(|| "Codex 账号".into());
+    let account_id = json_string(tokens.get("account_id"))
+        .or_else(|| auth.and_then(|v| json_string(v.get("account_id"))))
+        .or_else(|| {
+            decode_jwt_payload(&access).and_then(|v| {
+                v.get("https://api.openai.com/auth")
+                    .and_then(|a| json_string(a.get("account_id")))
+            })
+        });
+    let plan = auth.and_then(|v| json_string(v.get("chatgpt_plan_type")));
+    let token_date = auth.and_then(|v| json_string(v.get("chatgpt_subscription_active_until")));
+    Ok((
+        access,
+        email,
+        account_id.or_else(|| Some(String::new())),
+        plan.or(token_date),
+    ))
+}
+
+fn subscription_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    access: &str,
+    account_id: Option<&str>,
+    query: Option<(&str, &str)>,
+) -> Result<serde_json::Value, String> {
+    let mut request = client
+        .get(url)
+        .bearer_auth(access)
+        .header("Accept", "application/json")
+        .header("Referer", "https://chatgpt.com/")
+        .header("User-Agent", "Mozilla/5.0 Codex Float")
+        .header(
+            "x-openai-target-path",
+            url.trim_start_matches("https://chatgpt.com"),
+        )
+        .header(
+            "x-openai-target-route",
+            url.trim_start_matches("https://chatgpt.com"),
+        );
+    if let Some(id) = account_id.filter(|id| !id.is_empty()) {
+        request = request.header("ChatGPT-Account-Id", id);
+    }
+    if let Some((key, value)) = query {
+        request = request.query(&[(key, value)]);
+    }
+    let response = request
+        .send()
+        .map_err(|e| format!("订阅接口请求失败: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|e| format!("读取订阅接口响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("订阅接口返回 HTTP {status}"));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("订阅接口 JSON 无效: {e}"))
+}
+
+fn query_account_status(cache: &Mutex<Option<AccountCache>>) -> AccountStatus {
+    let identity = auth_identity();
+    let Ok((access, email, account_id, token_plan_or_date)) = identity else {
+        return AccountStatus {
+            subscription_state: "unknown".into(),
+            subscription_error: Some("尚未绑定可用的 Codex OAuth 账号".into()),
+            ..Default::default()
+        };
+    };
+    let cache_key = email.clone() + account_id.as_deref().unwrap_or("");
+    if let Ok(slot) = cache.lock() {
+        if let Some(cached) = slot.as_ref() {
+            if (Local::now() - cached.fetched_at).num_seconds() < ACCOUNT_CACHE_MAX_AGE_SECS
+                && cached.cache_key == cache_key
+            {
+                return cached.status.clone();
+            }
+        }
+    }
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return AccountStatus {
+                bound: true,
+                email: Some(email),
+                subscription_state: "unknown".into(),
+                subscription_error: Some(error.to_string()),
+                ..Default::default()
+            }
+        }
+    };
+    let mut status = AccountStatus {
+        bound: true,
+        email: Some(email.clone()),
+        plan_type: None,
+        subscription_active_until: None,
+        subscription_state: "unknown".into(),
+        subscription_error: None,
+        checked_at: Some(Local::now().to_rfc3339()),
+    };
+    let jwt_payload = decode_jwt_payload(&access);
+    status.plan_type = jwt_payload
+        .as_ref()
+        .and_then(|v| v.get("https://api.openai.com/auth"))
+        .and_then(|v| json_string(v.get("chatgpt_plan_type")));
+    if status.plan_type.is_none() {
+        status.plan_type = token_plan_or_date.clone();
+    }
+    status.subscription_active_until = jwt_payload
+        .as_ref()
+        .and_then(|v| v.get("https://api.openai.com/auth"))
+        .and_then(|v| json_string(v.get("chatgpt_subscription_active_until")))
+        .filter(|v| v.contains('T'));
+    let remote = subscription_request(
+        &client,
+        SUBSCRIPTION_CHECK_URL,
+        &access,
+        account_id.as_deref(),
+        Some((
+            "timezone_offset_min",
+            &((Local::now().offset().local_minus_utc() / 60).to_string()),
+        )),
+    );
+    if let Ok(value) = remote {
+        if status.plan_type.is_none() {
+            status.plan_type = find_key(&value, &["subscription_plan", "plan_type", "planType"]);
+        }
+        if status.subscription_active_until.is_none() {
+            status.subscription_active_until = find_key(
+                &value,
+                &["expires_at", "active_until", "subscription_active_until"],
+            );
+        }
+    }
+    if status.subscription_active_until.is_none() {
+        if let Some(id) = account_id.as_deref().filter(|id| !id.is_empty()) {
+            if let Ok(value) = subscription_request(
+                &client,
+                SUBSCRIPTIONS_URL,
+                &access,
+                Some(id),
+                Some(("account_id", id)),
+            ) {
+                if status.plan_type.is_none() {
+                    status.plan_type = find_key(&value, &["subscription_plan", "plan_type"]);
+                }
+                status.subscription_active_until = find_key(
+                    &value,
+                    &["active_until", "expires_at", "subscription_active_until"],
+                );
+            }
+        }
+    }
+    status.subscription_state = subscription_state(status.subscription_active_until.as_deref());
+    if status.subscription_active_until.is_none() {
+        status.subscription_error = Some("官方接口未返回订阅到期时间".into());
+    }
+    if let Ok(mut slot) = cache.lock() {
+        *slot = Some(AccountCache {
+            cache_key,
+            status: status.clone(),
+            fetched_at: Local::now(),
+        });
+    }
+    status
+}
+
 fn sums(c: &Connection, days: i64) -> rusqlite::Result<i64> {
     let since =
         (Local::now().date_naive() - chrono::Days::new(days.saturating_sub(1) as u64)).to_string();
@@ -444,20 +725,25 @@ fn read_rate_limits(cache: &Mutex<Option<RateCache>>) -> (Vec<RateWindow>, Strin
 }
 #[tauri::command]
 fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
-    let db = state.db.lock().unwrap();
     let home = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_default()
         .join(".codex/sessions");
-    let token_coverage = match scan_sessions(&db, &home) {
-        Ok(_) => "partial",
-        Err(_) => "unavailable",
+    let (token_coverage, today, last7, last30, daily) = {
+        let db = state.db.lock().unwrap();
+        let coverage = match scan_sessions(&db, &home) {
+            Ok(_) => "partial",
+            Err(_) => "unavailable",
+        };
+        (
+            coverage,
+            sums(&db, 1).unwrap_or(0),
+            sums(&db, 7).unwrap_or(0),
+            sums(&db, 30).unwrap_or(0),
+            series(&db).unwrap_or_default(),
+        )
     };
-    let today = sums(&db, 1).unwrap_or(0);
-    let last7 = sums(&db, 7).unwrap_or(0);
-    let last30 = sums(&db, 30).unwrap_or(0);
-    let daily = series(&db).unwrap_or_default();
     let expanded = *state.expanded.lock().unwrap();
     let (windows, status, freshness, rate_updated_at) = read_rate_limits(&state.rate_cache);
     Snapshot {
@@ -467,6 +753,7 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         last30,
         daily,
         windows,
+        account: query_account_status(&state.account_cache),
         rate_status: status,
         rate_freshness: freshness,
         token_coverage: token_coverage.into(),
@@ -865,6 +1152,20 @@ mod tests {
             fetched_at: now + chrono::Duration::seconds(1),
         };
         assert!(cached_rate_limits(Some(&cached), now).is_none());
+    }
+
+    #[test]
+    fn subscription_state_uses_subscription_date_not_token_expiry() {
+        assert_eq!(subscription_state(Some("2099-01-01T00:00:00Z")), "active");
+        assert_eq!(subscription_state(Some("2000-01-01T00:00:00Z")), "expired");
+        assert_eq!(subscription_state(Some("not-a-date")), "unknown");
+        assert_eq!(subscription_state(None), "unknown");
+    }
+
+    #[test]
+    fn jwt_payload_decoder_rejects_malformed_tokens() {
+        assert!(decode_jwt_payload("not-a-jwt").is_none());
+        assert!(decode_jwt_payload("a.b.c").is_none());
     }
 
     #[test]

@@ -13,6 +13,15 @@ type Snapshot = {
   last30: number;
   daily: { day: string; tokens: number }[];
   windows: RateWindow[];
+  account: {
+    bound: boolean;
+    email?: string;
+    planType?: string;
+    subscriptionActiveUntil?: string;
+    subscriptionState: string;
+    subscriptionError?: string;
+    checkedAt?: string;
+  };
   rateStatus: "live" | "stale" | "unavailable";
   rateFreshness: "live" | "stale" | "unavailable";
   tokenCoverage: "partial" | "unavailable";
@@ -26,6 +35,7 @@ const fallback: Snapshot = {
   last30: 0,
   daily: [],
   windows: [],
+  account: { bound: false, subscriptionState: "unknown" },
   rateStatus: "unavailable",
   rateFreshness: "unavailable",
   tokenCoverage: "unavailable",
@@ -117,6 +127,18 @@ function App() {
     const percent = Math.max(0, Math.min(100, remaining ?? 0));
     return `hsl(${percent * 1.2} 72% 56%)`;
   };
+  const subscriptionLabel = () => {
+    const raw = snapshot.account.subscriptionActiveUntil;
+    if (!raw) return snapshot.account.bound ? "订阅到期：暂不可用" : "未绑定 Codex 账号";
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return "订阅到期：日期无效";
+    const dateText = date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+    const days = Math.ceil((date.getTime() - Date.now()) / 86_400_000);
+    if (days <= 0) return `订阅已到期 · ${dateText}`;
+    return `订阅到期：${dateText} · 剩余 ${days} 天`;
+  };
+  const accountPlan = snapshot.account.planType ? ` · ${snapshot.account.planType}` : "";
+  const subscriptionClass = snapshot.account.subscriptionState;
 
   return (
     <main className={snapshot.expanded ? "expanded" : "collapsed"}>
@@ -155,6 +177,10 @@ function App() {
             <div>
               <b>Codex Float</b>
               <span>本机状态</span>
+            </div>
+            <div className="header-account" title={snapshot.account.subscriptionError ?? snapshot.account.email ?? "未绑定账号"}>
+              <strong>{snapshot.account.email ?? "未绑定账号"}</strong>
+              <small className={`subscription ${subscriptionClass}`}>{subscriptionLabel()}{accountPlan}</small>
             </div>
             <div className="header-actions">
               <button type="button" className="toggle-button panel-toggle" aria-label="收起窗口" title="收起窗口" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void toggle(); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" /></svg></button>
