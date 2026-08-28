@@ -35,6 +35,7 @@ pub struct Snapshot {
     pub rate_status: String,
     pub rate_freshness: String,
     pub token_coverage: String,
+    pub usage_source: String,
     pub updated_at: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +676,89 @@ fn read_rate_limits_uncached() -> (Vec<RateWindow>, String) {
     }
     (windows, "live".into())
 }
+fn read_account_usage_uncached() -> Option<Vec<DailyPoint>> {
+    let executable = resolve_codex_executable();
+    let mut command = if executable.extension().and_then(|v| v.to_str()) == Some("cmd") {
+        let mut c = Command::new("cmd.exe");
+        c.args(["/d", "/c"]).arg(executable);
+        c
+    } else {
+        Command::new(executable)
+    };
+    let mut child = command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut input = child.stdin.take()?;
+    let output = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    thread::spawn(move || {
+        for line in BufReader::new(output).lines().flatten() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    writeln!(input, r#"{{"id":1,"method":"initialize","params":{{"clientInfo":{{"name":"codex-float","title":"Codex Float","version":"0.1.0"}}}}}}"#).ok()?;
+    input.flush().ok()?;
+    if recv_response(&rx, 1, Duration::from_secs(5)).is_none() {
+        let _ = child.kill();
+        return None;
+    }
+    writeln!(input, r#"{{"method":"initialized"}}"#).ok()?;
+    writeln!(input, r#"{{"id":2,"method":"account/usage/read"}}"#).ok()?;
+    input.flush().ok()?;
+    let response = recv_response(&rx, 2, Duration::from_secs(15))?;
+    let buckets = response
+        .get("result")?
+        .get("dailyUsageBuckets")?
+        .as_array()?;
+    let mut daily = Vec::new();
+    for bucket in buckets {
+        let day = bucket
+            .get("startDate")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let tokens = bucket.get("tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !day.is_empty() {
+            daily.push(DailyPoint {
+                day: day.to_string(),
+                tokens,
+            });
+        }
+    }
+    let _ = child.kill();
+    (!daily.is_empty()).then_some(daily)
+}
+
+fn usage_totals(daily: &[DailyPoint], local_today: i64) -> (i64, i64, i64) {
+    let today = Local::now().date_naive();
+    let today_key = today.to_string();
+    let today_value = daily
+        .iter()
+        .find(|p| p.day == today_key)
+        .map(|p| p.tokens)
+        .unwrap_or(local_today);
+    let since7 = (today - chrono::Days::new(6)).to_string();
+    let since30 = (today - chrono::Days::new(29)).to_string();
+    let last7 = daily
+        .iter()
+        .filter(|p| p.day >= since7 && p.day <= today_key)
+        .map(|p| p.tokens)
+        .sum();
+    let last30 = daily
+        .iter()
+        .filter(|p| p.day >= since30 && p.day <= today_key)
+        .map(|p| p.tokens)
+        .sum();
+    (today_value, last7, last30)
+}
+
 const RATE_CACHE_MAX_AGE_SECS: i64 = 600;
 
 fn cached_rate_limits(
@@ -730,7 +814,7 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_default()
         .join(".codex/sessions");
-    let (token_coverage, today, last7, last30, daily) = {
+    let (token_coverage, local_today, local_last7, local_last30, local_daily) = {
         let db = state.db.lock().unwrap();
         let coverage = match scan_sessions(&db, &home) {
             Ok(_) => "partial",
@@ -743,6 +827,35 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
             sums(&db, 30).unwrap_or(0),
             series(&db).unwrap_or_default(),
         )
+    };
+    let account_daily = read_account_usage_uncached();
+    let (today, last7, last30, daily, usage_source, token_coverage) = match account_daily {
+        Some(daily) => {
+            let (today, last7, last30) = usage_totals(&daily, local_today);
+            let today_key = Local::now().date_naive().to_string();
+            let has_account_today = daily.iter().any(|point| point.day == today_key);
+            let source = if has_account_today {
+                "account"
+            } else {
+                "account_history_local_today"
+            };
+            (
+                today,
+                last7,
+                last30,
+                daily,
+                source.to_string(),
+                "account".to_string(),
+            )
+        }
+        None => (
+            local_today,
+            local_last7,
+            local_last30,
+            local_daily,
+            "local".to_string(),
+            token_coverage.to_string(),
+        ),
     };
     let expanded = *state.expanded.lock().unwrap();
     let (windows, status, freshness, rate_updated_at) = read_rate_limits(&state.rate_cache);
@@ -757,6 +870,7 @@ fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
         rate_status: status,
         rate_freshness: freshness,
         token_coverage: token_coverage.into(),
+        usage_source,
         updated_at: if rate_updated_at.is_empty() {
             Local::now().to_rfc3339()
         } else {
