@@ -113,6 +113,10 @@ function App() {
 
   const primary = snapshot.windows[0];
   const maxDay = useMemo(() => Math.max(...snapshot.daily.map((point) => point.tokens), 1), [snapshot.daily]);
+  const quotaColor = (remaining: number | null | undefined) => {
+    const percent = Math.max(0, Math.min(100, remaining ?? 0));
+    return `hsl(${percent * 1.2} 72% 56%)`;
+  };
 
   return (
     <main className={snapshot.expanded ? "expanded" : "collapsed"}>
@@ -163,7 +167,7 @@ function App() {
               <div className="quota-card" key={`${window.label}-${index}`}>
                 <span>{formatWindow(window)}</span>
                 <small>{formatReset(window.resetsAt)}</small>
-                <i><em style={{ width: `${window.remainingPercent ?? 0}%` }} /></i>
+                <i><em style={{ width: `${Math.max(0, Math.min(100, window.remainingPercent ?? 0))}%`, color: quotaColor(window.remainingPercent), background: quotaColor(window.remainingPercent) }} /></i>
               </div>
             )) : <div className="empty">额度暂不可用</div>}
           </section>

@@ -53,7 +53,7 @@ header button:not(.toggle-button) { border: 0; border-radius: 9px; padding: 5px 
 .quota-card span { display: block; font-size: 12px; font-weight: 650; }
 .quota-card small { display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; }
 .quota-card > i { display: block; height: 3px; margin-top: 8px; overflow: hidden; border-radius: 3px; background: #283140; }
-.quota-card > i > em { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#5bd9a3,#58aee4); }
+.quota-card > i > em { display: block; height: 100%; border-radius: inherit; background: #60dda5; transition: width .45s ease, background-color .45s ease, background .45s ease; box-shadow: 0 0 8px color-mix(in srgb, currentColor 28%, transparent); }
 .empty { grid-column: 1 / -1; display: grid; place-items: center; color: #9aa5b5; }
 .totals { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; margin-top: 9px; }
 .totals div { padding: 7px 8px; border-radius: 11px; background: rgba(255,255,255,.035); }
