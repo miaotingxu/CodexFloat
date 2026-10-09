@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatReset, formatTokens, formatWindow } from "./format";
+import { formatReset, formatResetCountdown, formatTokens, formatWindow } from "./format";
 
 describe("formatTokens", () => {
   it("formats compact dashboard totals", () => {
@@ -36,5 +36,15 @@ describe("quota formatting", () => {
 
   it("formats app-server epoch seconds as a reset hint", () => {
     expect(formatReset(1_893_499_200)).toContain("重置");
+  });
+
+  it("shows a compact reset countdown for collapsed and expanded views", () => {
+    const now = Date.parse("2026-09-30T12:00:00Z");
+    const resetAt = (value: string) => Date.parse(value) / 1000;
+    expect(formatResetCountdown(resetAt("2026-09-30T12:05:59Z"), now)).toBe("剩余 6 分钟");
+    expect(formatResetCountdown(resetAt("2026-09-30T13:00:00Z"), now)).toBe("剩余 1 小时");
+    expect(formatResetCountdown(resetAt("2026-10-01T13:00:00Z"), now)).toBe("剩余 1 天 1 小时");
+    expect(formatResetCountdown(resetAt("2026-09-30T11:59:00Z"), now)).toBe("即将重置");
+    expect(formatResetCountdown(undefined, now)).toBe("等待重置");
   });
 });

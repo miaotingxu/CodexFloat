@@ -4,7 +4,6 @@
   "description": "Codex Float main window permissions",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "core:window:allow-start-dragging"
+    "core:default"
   ]
 }

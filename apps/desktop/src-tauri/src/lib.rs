@@ -71,7 +71,6 @@ struct EventLine {
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
     pub bound: bool,
-    pub email: Option<String>,
     pub plan_type: Option<String>,
     pub subscription_active_until: Option<String>,
     pub subscription_state: String,
@@ -91,12 +90,58 @@ struct RateCache {
     fetched_at: DateTime<Local>,
 }
 
+#[derive(Default)]
+struct RateRetry {
+    last_attempt: Option<DateTime<Local>>,
+    consecutive_failures: u32,
+}
+
+struct RateState {
+    cache: Option<RateCache>,
+    retry: RateRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshMode {
+    Cached,
+    Force,
+}
+
+#[derive(Debug, Clone)]
+struct AccountUsageCache {
+    daily: Vec<DailyPoint>,
+    fetched_at: DateTime<Local>,
+}
+
+struct LocalTokenUsage {
+    today: i64,
+    last7: i64,
+    last30: i64,
+    daily: Vec<DailyPoint>,
+    coverage: String,
+}
+
+struct TokenSnapshot {
+    today: i64,
+    last7: i64,
+    last30: i64,
+    daily: Vec<DailyPoint>,
+    token_coverage: String,
+    usage_source: String,
+    today_available: bool,
+}
+
 pub struct Store {
     pub db: Mutex<Connection>,
     pub expanded: Mutex<bool>,
     pub click_through: Mutex<bool>,
-    rate_cache: Mutex<Option<RateCache>>,
+    user_hidden: Mutex<bool>,
+    rate_state: Mutex<RateState>,
+    rate_refresh: Mutex<()>,
     account_cache: Mutex<Option<AccountCache>>,
+    account_refresh: Mutex<()>,
+    account_usage_cache: Mutex<Option<AccountUsageCache>>,
+    account_usage_refresh: Mutex<()>,
 }
 impl Store {
     pub fn new(path: &Path) -> rusqlite::Result<Self> {
@@ -108,26 +153,91 @@ impl Store {
             })
             .map(|value| value != 0)
             .unwrap_or(false);
+        let rate_cache = load_rate_cache(&c);
         Ok(Self {
             db: Mutex::new(c),
             expanded: Mutex::new(expanded),
             click_through: Mutex::new(false),
-            rate_cache: Mutex::new(None),
+            user_hidden: Mutex::new(false),
+            rate_state: Mutex::new(RateState {
+                cache: rate_cache,
+                retry: RateRetry::default(),
+            }),
+            rate_refresh: Mutex::new(()),
             account_cache: Mutex::new(None),
+            account_refresh: Mutex::new(()),
+            account_usage_cache: Mutex::new(None),
+            account_usage_refresh: Mutex::new(()),
         })
     }
 }
-fn init(c: &Connection) -> rusqlite::Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS cursors(file_id TEXT PRIMARY KEY,file_hash TEXT NOT NULL,offset INTEGER NOT NULL,last_total INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY,file_id TEXT NOT NULL,event_offset INTEGER NOT NULL,total_tokens INTEGER NOT NULL,delta_tokens INTEGER NOT NULL,day TEXT NOT NULL); CREATE TABLE IF NOT EXISTS daily(day TEXT PRIMARY KEY,tokens INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS window_state(id INTEGER PRIMARY KEY CHECK(id=1),x INTEGER NOT NULL,y INTEGER NOT NULL,expanded INTEGER NOT NULL DEFAULT 0);")
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibilityAction {
+    None,
+    Hide,
+    Show,
 }
+
+fn fullscreen_visibility_transition(
+    is_fullscreen: bool,
+    user_hidden: bool,
+    hidden_by_fullscreen: bool,
+) -> (bool, VisibilityAction) {
+    if is_fullscreen && !user_hidden && !hidden_by_fullscreen {
+        (true, VisibilityAction::Hide)
+    } else if !is_fullscreen && hidden_by_fullscreen {
+        if user_hidden {
+            (false, VisibilityAction::None)
+        } else {
+            (false, VisibilityAction::Show)
+        }
+    } else {
+        (hidden_by_fullscreen, VisibilityAction::None)
+    }
+}
+
+fn init(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch("CREATE TABLE IF NOT EXISTS cursors(file_id TEXT PRIMARY KEY,file_hash TEXT NOT NULL,offset INTEGER NOT NULL,last_total INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY,file_id TEXT NOT NULL,event_offset INTEGER NOT NULL,total_tokens INTEGER NOT NULL,delta_tokens INTEGER NOT NULL,day TEXT NOT NULL); CREATE TABLE IF NOT EXISTS daily(day TEXT PRIMARY KEY,tokens INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS window_state(id INTEGER PRIMARY KEY CHECK(id=1),x INTEGER NOT NULL,y INTEGER NOT NULL,expanded INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS quota_cache(id INTEGER PRIMARY KEY CHECK(id=1),windows_json TEXT NOT NULL,fetched_at TEXT NOT NULL);")
+}
+
+fn load_rate_cache(c: &Connection) -> Option<RateCache> {
+    let (windows_json, fetched_at): (String, String) = c
+        .query_row(
+            "SELECT windows_json,fetched_at FROM quota_cache WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let windows = serde_json::from_str(&windows_json).ok()?;
+    let fetched_at = DateTime::parse_from_rfc3339(&fetched_at)
+        .ok()?
+        .with_timezone(&Local);
+    Some(RateCache {
+        windows,
+        fetched_at,
+    })
+}
+
+fn save_rate_cache(c: &Connection, cache: &RateCache) -> rusqlite::Result<()> {
+    let windows_json = serde_json::to_string(&cache.windows)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    c.execute(
+        "INSERT INTO quota_cache(id,windows_json,fetched_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET windows_json=excluded.windows_json,fetched_at=excluded.fetched_at",
+        params![windows_json, cache.fetched_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn cleanup_old_daily(c: &Connection, keep_days: i64) -> rusqlite::Result<usize> {
     let cutoff = (Local::now().date_naive()
         - chrono::Days::new(keep_days.saturating_sub(1) as u64))
     .to_string();
+    c.execute("DELETE FROM events WHERE day < ?", [&cutoff])?;
     c.execute("DELETE FROM daily WHERE day < ?", [cutoff])
 }
 fn clear_token_data(c: &Connection) -> rusqlite::Result<()> {
-    c.execute_batch("DELETE FROM events; DELETE FROM daily; DELETE FROM cursors;")
+    c.execute_batch("DELETE FROM events; DELETE FROM daily;")
 }
 fn digest(s: &str) -> String {
     let mut h = Sha256::new();
@@ -136,6 +246,27 @@ fn digest(s: &str) -> String {
 }
 fn file_id(path: &Path) -> String {
     digest(&path.to_string_lossy())
+}
+fn remove_file_events(c: &Connection, id: &str) -> rusqlite::Result<()> {
+    let contributions = {
+        let mut statement =
+            c.prepare("SELECT day, SUM(delta_tokens) FROM events WHERE file_id=? GROUP BY day")?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (day, tokens) in contributions {
+        c.execute(
+            "UPDATE daily SET tokens=MAX(0,tokens-?) WHERE day=?",
+            params![tokens, day],
+        )?;
+        c.execute("DELETE FROM daily WHERE day=? AND tokens=0", [&day])?;
+    }
+    c.execute("DELETE FROM events WHERE file_id=?", [id])?;
+    Ok(())
 }
 fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
     let id = file_id(path);
@@ -150,11 +281,11 @@ fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
             |r| Ok((Some(r.get(0)?), r.get(1)?, r.get(2)?)),
         )
         .unwrap_or((None, 0, 0));
-    let start = if old_offset <= current_len {
-        old_offset
-    } else {
-        0
-    };
+    let truncated = old_offset > current_len;
+    if truncated {
+        remove_file_events(c, &id)?;
+    }
+    let start = if truncated { 0 } else { old_offset };
     let f =
         fs::File::open(path).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let mut reader = BufReader::new(f);
@@ -164,12 +295,28 @@ fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
     let mut offset = start;
     let mut previous = if start > 0 { last_total } else { 0 };
     let mut count = 0;
-    for line in reader.lines() {
-        let line = line.map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let bytes = line.as_bytes().len() as i64 + 1;
+    loop {
         let at = offset;
-        offset += bytes;
-        let Ok(ev) = serde_json::from_str::<EventLine>(&line) else {
+        let mut line = Vec::new();
+        let bytes = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        if bytes == 0 {
+            break;
+        }
+        let complete_line = line.last() == Some(&b'\n');
+        if complete_line {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        let parsed = serde_json::from_slice::<EventLine>(&line);
+        if parsed.is_err() && !complete_line {
+            break;
+        }
+        offset += bytes as i64;
+        let Ok(ev) = parsed else {
             continue;
         };
         if ev.kind.as_deref() != Some("event_msg") {
@@ -209,12 +356,11 @@ fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
     Ok(count)
 }
 pub fn scan_sessions(c: &Connection, root: &Path) -> rusqlite::Result<usize> {
-    cleanup_old_daily(c, 30)?;
-    c.execute_batch("DELETE FROM events; DELETE FROM daily; DELETE FROM cursors;")?;
-    let mut n = 0;
-    if !root.exists() {
+    if !root.is_dir() {
         return Ok(0);
     }
+    c.execute_batch("BEGIN IMMEDIATE")?;
+    let mut n = 0;
     fn walk(c: &Connection, p: &Path, n: &mut usize) -> rusqlite::Result<()> {
         for e in
             fs::read_dir(p).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
@@ -230,21 +376,80 @@ pub fn scan_sessions(c: &Connection, root: &Path) -> rusqlite::Result<usize> {
         }
         Ok(())
     }
-    walk(c, root, &mut n)?;
-    Ok(n)
+    let result = walk(c, root, &mut n).and_then(|()| {
+        cleanup_old_daily(c, 30)?;
+        Ok(n)
+    });
+    match result {
+        Ok(count) => {
+            c.execute_batch("COMMIT")?;
+            Ok(count)
+        }
+        Err(error) => {
+            let _ = c.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 const SUBSCRIPTION_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const SUBSCRIPTIONS_URL: &str = "https://chatgpt.com/backend-api/subscriptions";
 const ACCOUNT_CACHE_MAX_AGE_SECS: i64 = 30 * 60;
+const ACCOUNT_USAGE_CACHE_MAX_AGE_SECS: i64 = 120;
+
+fn codex_home_from(
+    codex_home: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    codex_home
+        .or_else(|| user_profile.map(|path| path.join(".codex")))
+        .or_else(|| home.map(|path| path.join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+fn codex_home() -> PathBuf {
+    codex_home_from(
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn sessions_path_from(
+    codex_home: Option<&Path>,
+    user_profile: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    codex_home_from(
+        codex_home.map(Path::to_path_buf),
+        user_profile.map(Path::to_path_buf),
+        home.map(Path::to_path_buf),
+    )
+    .join("sessions")
+}
+
+fn sessions_path() -> PathBuf {
+    let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    sessions_path_from(
+        codex_home.as_deref(),
+        user_profile.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn token_coverage(root_exists: bool, scan_succeeded: bool) -> &'static str {
+    if root_exists && scan_succeeded {
+        "partial"
+    } else {
+        "unavailable"
+    }
+}
 
 fn auth_file_path() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".codex")))
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
-        .join("auth.json")
+    codex_home().join("auth.json")
 }
 
 fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
@@ -307,7 +512,44 @@ fn subscription_state(date: Option<&str>) -> String {
     }
 }
 
-fn auth_identity() -> Result<(String, String, Option<String>, Option<String>), String> {
+fn normalize_plan_type(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty()
+        || DateTime::parse_from_rfc3339(value).is_ok()
+        || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn normalize_subscription_date(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if DateTime::parse_from_rfc3339(value).is_ok() {
+        Some(value.to_string())
+    } else {
+        chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .map(|date| format!("{date}T00:00:00Z"))
+    }
+}
+
+fn auth_plan_type(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| json_string(auth.get("chatgpt_plan_type")))
+        .and_then(|plan| normalize_plan_type(&plan))
+}
+
+fn auth_subscription_active_until(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| json_string(auth.get("chatgpt_subscription_active_until")))
+        .and_then(|date| normalize_subscription_date(&date))
+}
+
+fn auth_identity() -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
     let raw = fs::read_to_string(auth_file_path())
         .map_err(|e| format!("读取 Codex 登录文件失败: {e}"))?;
     let value: serde_json::Value =
@@ -316,29 +558,22 @@ fn auth_identity() -> Result<(String, String, Option<String>, Option<String>), S
     let access =
         json_string(tokens.get("access_token")).ok_or("Codex 登录文件没有 access_token")?;
     let id_token = json_string(tokens.get("id_token")).unwrap_or_default();
+    let access_payload = decode_jwt_payload(&access);
     let payload = decode_jwt_payload(&id_token)
-        .or_else(|| decode_jwt_payload(&access))
+        .or_else(|| access_payload.clone())
         .unwrap_or(serde_json::Value::Null);
     let auth = payload.get("https://api.openai.com/auth");
-    let email = json_string(payload.get("email"))
-        .or_else(|| auth.and_then(|v| json_string(v.get("email"))))
-        .unwrap_or_else(|| "Codex 账号".into());
     let account_id = json_string(tokens.get("account_id"))
         .or_else(|| auth.and_then(|v| json_string(v.get("account_id"))))
         .or_else(|| {
-            decode_jwt_payload(&access).and_then(|v| {
-                v.get("https://api.openai.com/auth")
-                    .and_then(|a| json_string(a.get("account_id")))
-            })
+            access_payload
+                .as_ref()
+                .and_then(|value| value.get("https://api.openai.com/auth"))
+                .and_then(|value| json_string(value.get("account_id")))
         });
-    let plan = auth.and_then(|v| json_string(v.get("chatgpt_plan_type")));
-    let token_date = auth.and_then(|v| json_string(v.get("chatgpt_subscription_active_until")));
-    Ok((
-        access,
-        email,
-        account_id.or_else(|| Some(String::new())),
-        plan.or(token_date),
-    ))
+    let plan = auth_plan_type(&payload);
+    let active_until = auth_subscription_active_until(&payload);
+    Ok((access, account_id, plan, active_until))
 }
 
 fn subscription_request(
@@ -381,99 +616,148 @@ fn subscription_request(
     serde_json::from_str(&body).map_err(|e| format!("订阅接口 JSON 无效: {e}"))
 }
 
-fn query_account_status(cache: &Mutex<Option<AccountCache>>) -> AccountStatus {
-    let identity = auth_identity();
-    let Ok((access, email, account_id, token_plan_or_date)) = identity else {
-        return AccountStatus {
-            subscription_state: "unknown".into(),
-            subscription_error: Some("尚未绑定可用的 Codex OAuth 账号".into()),
-            ..Default::default()
-        };
+fn cached_account_status(
+    cache: &Mutex<Option<AccountCache>>,
+    cache_key: &str,
+    mode: RefreshMode,
+    request_started: DateTime<Local>,
+    now: DateTime<Local>,
+) -> Option<AccountStatus> {
+    let slot = cache.lock().ok()?;
+    let cached = slot.as_ref()?;
+    if cached.cache_key != cache_key {
+        return None;
+    }
+    let use_cached = match mode {
+        RefreshMode::Cached => {
+            let age = (now - cached.fetched_at).num_seconds();
+            (0..ACCOUNT_CACHE_MAX_AGE_SECS).contains(&age)
+        }
+        RefreshMode::Force => cached.fetched_at >= request_started,
     };
-    let cache_key = email.clone() + account_id.as_deref().unwrap_or("");
+    use_cached.then(|| cached.status.clone())
+}
+
+fn account_status_fallback(
+    cache: &Mutex<Option<AccountCache>>,
+    cache_key: Option<&str>,
+    bound: bool,
+    error: String,
+) -> AccountStatus {
     if let Ok(slot) = cache.lock() {
-        if let Some(cached) = slot.as_ref() {
-            if (Local::now() - cached.fetched_at).num_seconds() < ACCOUNT_CACHE_MAX_AGE_SECS
-                && cached.cache_key == cache_key
-            {
-                return cached.status.clone();
-            }
+        if let Some(cached) = slot
+            .as_ref()
+            .filter(|cached| cache_key.map(|key| cached.cache_key == key).unwrap_or(true))
+        {
+            let mut status = cached.status.clone();
+            status.subscription_error = Some(error);
+            return status;
         }
     }
-    let client = match reqwest::blocking::Client::builder()
+    AccountStatus {
+        bound,
+        subscription_state: "unknown".into(),
+        subscription_error: Some(error),
+        checked_at: Some(Local::now().to_rfc3339()),
+        ..Default::default()
+    }
+}
+
+fn read_account_status_with<F>(
+    cache: &Mutex<Option<AccountCache>>,
+    refresh: &Mutex<()>,
+    cache_key: &str,
+    mode: RefreshMode,
+    fetch: F,
+) -> AccountStatus
+where
+    F: FnOnce() -> Result<AccountStatus, String>,
+{
+    let request_started = Local::now();
+    if let Some(status) =
+        cached_account_status(cache, cache_key, mode, request_started, Local::now())
+    {
+        return status;
+    }
+    let Ok(_refresh_guard) = refresh.lock() else {
+        return account_status_fallback(cache, Some(cache_key), true, "账户状态刷新不可用".into());
+    };
+    if let Some(status) =
+        cached_account_status(cache, cache_key, mode, request_started, Local::now())
+    {
+        return status;
+    }
+    match fetch() {
+        Ok(status) => {
+            if let Ok(mut slot) = cache.lock() {
+                *slot = Some(AccountCache {
+                    cache_key: cache_key.into(),
+                    status: status.clone(),
+                    fetched_at: Local::now(),
+                });
+            }
+            status
+        }
+        Err(error) => account_status_fallback(cache, Some(cache_key), true, error),
+    }
+}
+
+fn fetch_account_status(
+    access: &str,
+    account_id: Option<&str>,
+    token_plan: Option<String>,
+    token_active_until: Option<String>,
+) -> Result<AccountStatus, String> {
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return AccountStatus {
-                bound: true,
-                email: Some(email),
-                subscription_state: "unknown".into(),
-                subscription_error: Some(error.to_string()),
-                ..Default::default()
-            }
-        }
-    };
+        .map_err(|error| format!("账户状态客户端初始化失败: {error}"))?;
     let mut status = AccountStatus {
         bound: true,
-        email: Some(email.clone()),
-        plan_type: None,
-        subscription_active_until: None,
+        plan_type: token_plan,
+        subscription_active_until: token_active_until,
         subscription_state: "unknown".into(),
         subscription_error: None,
         checked_at: Some(Local::now().to_rfc3339()),
     };
-    let jwt_payload = decode_jwt_payload(&access);
-    status.plan_type = jwt_payload
-        .as_ref()
-        .and_then(|v| v.get("https://api.openai.com/auth"))
-        .and_then(|v| json_string(v.get("chatgpt_plan_type")));
-    if status.plan_type.is_none() {
-        status.plan_type = token_plan_or_date.clone();
-    }
-    status.subscription_active_until = jwt_payload
-        .as_ref()
-        .and_then(|v| v.get("https://api.openai.com/auth"))
-        .and_then(|v| json_string(v.get("chatgpt_subscription_active_until")))
-        .filter(|v| v.contains('T'));
-    let remote = subscription_request(
+    let timezone_offset_min = (Local::now().offset().local_minus_utc() / 60).to_string();
+    if let Ok(value) = subscription_request(
         &client,
         SUBSCRIPTION_CHECK_URL,
-        &access,
-        account_id.as_deref(),
-        Some((
-            "timezone_offset_min",
-            &((Local::now().offset().local_minus_utc() / 60).to_string()),
-        )),
-    );
-    if let Ok(value) = remote {
+        access,
+        account_id,
+        Some(("timezone_offset_min", &timezone_offset_min)),
+    ) {
         if status.plan_type.is_none() {
-            status.plan_type = find_key(&value, &["subscription_plan", "plan_type", "planType"]);
+            status.plan_type = find_key(&value, &["subscription_plan", "plan_type", "planType"])
+                .and_then(|plan| normalize_plan_type(&plan));
         }
         if status.subscription_active_until.is_none() {
             status.subscription_active_until = find_key(
                 &value,
                 &["expires_at", "active_until", "subscription_active_until"],
-            );
+            )
+            .and_then(|date| normalize_subscription_date(&date));
         }
     }
     if status.subscription_active_until.is_none() {
-        if let Some(id) = account_id.as_deref().filter(|id| !id.is_empty()) {
+        if let Some(id) = account_id.filter(|id| !id.is_empty()) {
             if let Ok(value) = subscription_request(
                 &client,
                 SUBSCRIPTIONS_URL,
-                &access,
+                access,
                 Some(id),
                 Some(("account_id", id)),
             ) {
                 if status.plan_type.is_none() {
-                    status.plan_type = find_key(&value, &["subscription_plan", "plan_type"]);
+                    status.plan_type = find_key(&value, &["subscription_plan", "plan_type"])
+                        .and_then(|plan| normalize_plan_type(&plan));
                 }
                 status.subscription_active_until = find_key(
                     &value,
                     &["active_until", "expires_at", "subscription_active_until"],
-                );
+                )
+                .and_then(|date| normalize_subscription_date(&date));
             }
         }
     }
@@ -481,14 +765,29 @@ fn query_account_status(cache: &Mutex<Option<AccountCache>>) -> AccountStatus {
     if status.subscription_active_until.is_none() {
         status.subscription_error = Some("官方接口未返回订阅到期时间".into());
     }
-    if let Ok(mut slot) = cache.lock() {
-        *slot = Some(AccountCache {
-            cache_key,
-            status: status.clone(),
-            fetched_at: Local::now(),
-        });
-    }
-    status
+    Ok(status)
+}
+
+fn query_account_status(
+    cache: &Mutex<Option<AccountCache>>,
+    refresh: &Mutex<()>,
+    mode: RefreshMode,
+) -> AccountStatus {
+    let (access, account_id, token_plan, token_active_until) = match auth_identity() {
+        Ok(identity) => identity,
+        Err(error) => return account_status_fallback(cache, None, false, error),
+    };
+    let cache_identity = account_id.as_deref().unwrap_or(&access);
+    let cache_key = digest(cache_identity);
+    let fetch_account_id = account_id.clone();
+    read_account_status_with(cache, refresh, &cache_key, mode, move || {
+        fetch_account_status(
+            &access,
+            fetch_account_id.as_deref(),
+            token_plan,
+            token_active_until,
+        )
+    })
 }
 
 fn sums(c: &Connection, days: i64) -> rusqlite::Result<i64> {
@@ -536,6 +835,54 @@ fn recv_response(
 
 fn first_existing_path(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
+}
+
+fn parse_rate_limits_response(
+    response: &serde_json::Value,
+) -> Result<Vec<RateWindow>, &'static str> {
+    if response.get("error").is_some() {
+        return Err("protocol_error");
+    }
+    let rate_limits = response
+        .get("result")
+        .and_then(|value| value.get("rateLimits"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or("invalid_response")?;
+    let mut windows = rate_limits
+        .iter()
+        .filter_map(|(key, value)| {
+            let value = value.as_object()?;
+            let used = value.get("usedPercent")?.as_f64()?;
+            let resets_at = value.get("resetsAt").and_then(|value| value.as_i64());
+            let minutes = value
+                .get("windowDurationMins")
+                .and_then(|value| value.as_i64());
+            let label = match minutes {
+                Some(300) => "5 小时".to_string(),
+                Some(10_080) => "7 天".to_string(),
+                Some(value) if value > 0 && value % 1_440 == 0 => {
+                    format!("{} 天", value / 1_440)
+                }
+                Some(value) if value > 0 && value % 60 == 0 => {
+                    format!("{} 小时", value / 60)
+                }
+                Some(value) if value > 0 => format!("{value} 分钟"),
+                _ => key.to_string(),
+            };
+            Some(RateWindow {
+                label,
+                used_percent: Some(used),
+                remaining_percent: Some((100.0 - used).clamp(0.0, 100.0)),
+                resets_at,
+                window_minutes: minutes,
+            })
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|window| window.window_minutes.unwrap_or(i64::MAX));
+    if windows.is_empty() {
+        return Err("empty_snapshot");
+    }
+    Ok(windows)
 }
 
 fn resolve_codex_executable() -> PathBuf {
@@ -639,37 +986,10 @@ fn read_rate_limits_uncached() -> (Vec<RateWindow>, String) {
     let Some(response) = response else {
         return (vec![], "unavailable".into());
     };
-    let result = response
-        .get("result")
-        .and_then(|value| value.get("rateLimits"))
-        .unwrap_or(&serde_json::Value::Null);
-    let mut windows = Vec::new();
-    for key in ["primary", "secondary"] {
-        let Some(value) = result.get(key).and_then(|value| value.as_object()) else {
-            continue;
-        };
-        let used = value.get("usedPercent").and_then(|value| value.as_f64());
-        let resets_at = value.get("resetsAt").and_then(|value| value.as_i64());
-        let minutes = value
-            .get("windowDurationMins")
-            .and_then(|value| value.as_i64());
-        let label = match minutes {
-            Some(300) => "5 小时".to_string(),
-            Some(10_080) => "7 天".to_string(),
-            Some(value) if value % 1_440 == 0 => format!("{} 天", value / 1_440),
-            Some(value) if value % 60 == 0 => format!("{} 小时", value / 60),
-            Some(value) => format!("{value} 分钟"),
-            None => key.to_string(),
-        };
-        windows.push(RateWindow {
-            label,
-            used_percent: used,
-            remaining_percent: used.map(|value| (100.0 - value).clamp(0.0, 100.0)),
-            resets_at,
-            window_minutes: minutes,
-        });
+    match parse_rate_limits_response(&response) {
+        Ok(windows) => (windows, "live".into()),
+        Err(_) => (vec![], "unavailable".into()),
     }
-    (windows, "live".into())
 }
 fn read_account_usage_uncached() -> Option<Vec<DailyPoint>> {
     let executable = resolve_codex_executable();
@@ -731,14 +1051,70 @@ fn read_account_usage_uncached() -> Option<Vec<DailyPoint>> {
     (!daily.is_empty()).then_some(daily)
 }
 
-fn usage_totals(daily: &[DailyPoint], local_today: i64) -> (i64, i64, i64) {
-    let today = Local::now().date_naive();
+fn cached_account_usage(
+    cache: &Mutex<Option<AccountUsageCache>>,
+    mode: RefreshMode,
+    request_started: DateTime<Local>,
+    now: DateTime<Local>,
+) -> Option<Vec<DailyPoint>> {
+    let slot = cache.lock().ok()?;
+    let cached = slot.as_ref()?;
+    let use_cached = match mode {
+        RefreshMode::Cached => {
+            let age = (now - cached.fetched_at).num_seconds();
+            (0..ACCOUNT_USAGE_CACHE_MAX_AGE_SECS).contains(&age)
+        }
+        RefreshMode::Force => cached.fetched_at >= request_started,
+    };
+    use_cached.then(|| cached.daily.clone())
+}
+
+fn read_account_usage_with<F>(
+    cache: &Mutex<Option<AccountUsageCache>>,
+    refresh: &Mutex<()>,
+    mode: RefreshMode,
+    fetch: F,
+) -> Option<Vec<DailyPoint>>
+where
+    F: FnOnce() -> Option<Vec<DailyPoint>>,
+{
+    let request_started = Local::now();
+    if let Some(daily) = cached_account_usage(cache, mode, request_started, Local::now()) {
+        return Some(daily);
+    }
+    let _refresh_guard = refresh.lock().ok()?;
+    if let Some(daily) = cached_account_usage(cache, mode, request_started, Local::now()) {
+        return Some(daily);
+    }
+    let daily = fetch()?;
+    if daily.is_empty() {
+        return None;
+    }
+    if let Ok(mut slot) = cache.lock() {
+        *slot = Some(AccountUsageCache {
+            daily: daily.clone(),
+            fetched_at: Local::now(),
+        });
+    }
+    Some(daily)
+}
+
+fn read_account_usage(
+    cache: &Mutex<Option<AccountUsageCache>>,
+    refresh: &Mutex<()>,
+    mode: RefreshMode,
+) -> Option<Vec<DailyPoint>> {
+    read_account_usage_with(cache, refresh, mode, read_account_usage_uncached)
+}
+
+fn usage_totals(daily: &[DailyPoint], today: chrono::NaiveDate) -> (i64, i64, i64, bool) {
     let today_key = today.to_string();
+    let today_available = daily.iter().any(|point| point.day == today_key);
     let today_value = daily
         .iter()
-        .find(|p| p.day == today_key)
+        .filter(|p| p.day == today_key)
         .map(|p| p.tokens)
-        .unwrap_or(local_today);
+        .sum();
     let since7 = (today - chrono::Days::new(6)).to_string();
     let since30 = (today - chrono::Days::new(29)).to_string();
     let last7 = daily
@@ -751,50 +1127,114 @@ fn usage_totals(daily: &[DailyPoint], local_today: i64) -> (i64, i64, i64) {
         .filter(|p| p.day >= since30 && p.day <= today_key)
         .map(|p| p.tokens)
         .sum();
-    (today_value, last7, last30)
+    (today_value, last7, last30, today_available)
 }
 
-const RATE_CACHE_MAX_AGE_SECS: i64 = 600;
+fn select_token_snapshot(
+    account_daily: Option<Vec<DailyPoint>>,
+    local: LocalTokenUsage,
+    today: chrono::NaiveDate,
+) -> TokenSnapshot {
+    if let Some(daily) = account_daily.filter(|daily| !daily.is_empty()) {
+        let (today_tokens, last7, last30, today_available) = usage_totals(&daily, today);
+        return TokenSnapshot {
+            today: today_available.then_some(today_tokens).unwrap_or(0),
+            last7,
+            last30,
+            daily,
+            token_coverage: "account".into(),
+            usage_source: if today_available {
+                "account".into()
+            } else {
+                "account_history_pending_today".into()
+            },
+            today_available,
+        };
+    }
+    let today_available = local.coverage != "unavailable";
+    TokenSnapshot {
+        today: local.today,
+        last7: local.last7,
+        last30: local.last30,
+        daily: local.daily,
+        token_coverage: local.coverage,
+        usage_source: "local".into(),
+        today_available,
+    }
+}
+
+const RATE_REFRESH_INTERVAL_SECS: i64 = 120;
+const RATE_LIVE_MAX_AGE_SECS: i64 = 180;
+const RATE_CACHE_MAX_AGE_SECS: i64 = 15 * 60;
+
+fn rate_retry_delay_secs(failures: u32) -> i64 {
+    match failures {
+        0 => 0,
+        1 => 5,
+        2 => 15,
+        _ => 30,
+    }
+}
+
+fn rate_cache_status(cache: Option<&RateCache>, now: DateTime<Local>) -> Option<&'static str> {
+    let cache = cache?;
+    if cache.windows.is_empty() {
+        return None;
+    }
+    let age = (now - cache.fetched_at).num_seconds();
+    if age < 0 || age > RATE_CACHE_MAX_AGE_SECS {
+        return None;
+    }
+    if age < RATE_LIVE_MAX_AGE_SECS {
+        Some("live")
+    } else {
+        Some("stale")
+    }
+}
+
+fn discard_expired_rate_cache(
+    state: &Mutex<RateState>,
+    db: &Mutex<Connection>,
+    now: DateTime<Local>,
+) {
+    let expired = if let Ok(mut state) = state.lock() {
+        let expired = state
+            .cache
+            .as_ref()
+            .is_some_and(|cache| rate_cache_status(Some(cache), now).is_none());
+        if expired {
+            state.cache = None;
+        }
+        expired
+    } else {
+        false
+    };
+    if expired {
+        if let Ok(db) = db.lock() {
+            let _ = db.execute("DELETE FROM quota_cache WHERE id=1", []);
+        }
+    }
+}
 
 fn cached_rate_limits(
     cache: Option<&RateCache>,
     now: DateTime<Local>,
 ) -> Option<(Vec<RateWindow>, String)> {
     let cached = cache?;
-    let age = (now - cached.fetched_at).num_seconds();
-    if age < 0 || age > RATE_CACHE_MAX_AGE_SECS {
-        return None;
-    }
+    rate_cache_status(Some(cached), now)?;
     Some((cached.windows.clone(), cached.fetched_at.to_rfc3339()))
 }
 
-fn read_rate_limits(cache: &Mutex<Option<RateCache>>) -> (Vec<RateWindow>, String, String, String) {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(read_rate_limits_uncached());
-    });
-    if let Ok((windows, status)) = receiver.recv_timeout(Duration::from_secs(15)) {
-        if status == "live" {
-            let fetched_at = Local::now();
-            if let Ok(mut slot) = cache.lock() {
-                *slot = Some(RateCache {
-                    windows: windows.clone(),
-                    fetched_at,
-                });
-            }
-            return (
-                windows,
-                "live".into(),
-                "live".into(),
-                fetched_at.to_rfc3339(),
-            );
-        }
-    }
-    if let Ok(slot) = cache.lock() {
-        if let Some((windows, fetched_at)) = cached_rate_limits(slot.as_ref(), Local::now()) {
-            return (windows, "stale".into(), "stale".into(), fetched_at);
-        }
-    }
+fn cached_rate_response(
+    state: &RateState,
+    now: DateTime<Local>,
+) -> Option<(Vec<RateWindow>, String, String, String)> {
+    let (windows, fetched_at) = cached_rate_limits(state.cache.as_ref(), now)?;
+    let status = rate_cache_status(state.cache.as_ref(), now)?;
+    Some((windows, status.into(), status.into(), fetched_at))
+}
+
+fn rate_unavailable() -> (Vec<RateWindow>, String, String, String) {
     (
         vec![],
         "unavailable".into(),
@@ -802,50 +1242,199 @@ fn read_rate_limits(cache: &Mutex<Option<RateCache>>) -> (Vec<RateWindow>, Strin
         String::new(),
     )
 }
-#[tauri::command]
-fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
-    let home = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_default()
-        .join(".codex/sessions");
-    let (token_coverage, today, last7, last30, daily) = {
-        let db = state.db.lock().unwrap();
-        let coverage = match scan_sessions(&db, &home) {
-            Ok(_) => "partial",
-            Err(_) => "unavailable",
-        };
-        (
-            coverage,
-            sums(&db, 1).unwrap_or(0),
-            sums(&db, 7).unwrap_or(0),
-            sums(&db, 30).unwrap_or(0),
-            series(&db).unwrap_or_default(),
-        )
+
+fn retry_is_due(retry: &RateRetry, now: DateTime<Local>) -> bool {
+    let delay = rate_retry_delay_secs(retry.consecutive_failures);
+    if delay == 0 {
+        return true;
+    }
+    retry
+        .last_attempt
+        .map(|last| (now - last).num_seconds() >= delay)
+        .unwrap_or(true)
+}
+
+fn read_rate_limits_with<F>(
+    state: &Mutex<RateState>,
+    refresh: &Mutex<()>,
+    db: &Mutex<Connection>,
+    mode: RefreshMode,
+    fetch: F,
+) -> (Vec<RateWindow>, String, String, String)
+where
+    F: FnOnce() -> (Vec<RateWindow>, String),
+{
+    let request_started = Local::now();
+    discard_expired_rate_cache(state, db, request_started);
+    if matches!(mode, RefreshMode::Cached) {
+        if let Ok(state) = state.lock() {
+            if let Some(cache) = state.cache.as_ref() {
+                let age = (request_started - cache.fetched_at).num_seconds();
+                if (0..RATE_REFRESH_INTERVAL_SECS).contains(&age) {
+                    if let Some(snapshot) = cached_rate_response(&state, request_started) {
+                        return snapshot;
+                    }
+                }
+            }
+            if !retry_is_due(&state.retry, request_started) {
+                return cached_rate_response(&state, request_started)
+                    .unwrap_or_else(rate_unavailable);
+            }
+        }
+    }
+
+    let Ok(_refresh_guard) = refresh.lock() else {
+        return rate_unavailable();
     };
-    let usage_source = "local".to_string();
-    let today_available = true;
+    let attempt_at = Local::now();
+    if let Ok(mut state) = state.lock() {
+        match mode {
+            RefreshMode::Cached => {
+                if let Some(cache) = state.cache.as_ref() {
+                    let age = (attempt_at - cache.fetched_at).num_seconds();
+                    if (0..RATE_REFRESH_INTERVAL_SECS).contains(&age) {
+                        if let Some(snapshot) = cached_rate_response(&state, attempt_at) {
+                            return snapshot;
+                        }
+                    }
+                }
+                if !retry_is_due(&state.retry, attempt_at) {
+                    return cached_rate_response(&state, attempt_at)
+                        .unwrap_or_else(rate_unavailable);
+                }
+            }
+            RefreshMode::Force => {
+                if state
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.fetched_at >= request_started)
+                {
+                    if let Some(snapshot) = cached_rate_response(&state, attempt_at) {
+                        return snapshot;
+                    }
+                }
+            }
+        }
+        state.retry.last_attempt = Some(attempt_at);
+    } else {
+        return rate_unavailable();
+    }
+
+    let (windows, status) = fetch();
+    let fetched_at = Local::now();
+    if status == "live" && !windows.is_empty() {
+        let cache = RateCache {
+            windows: windows.clone(),
+            fetched_at,
+        };
+        if let Ok(mut state) = state.lock() {
+            state.cache = Some(cache);
+            state.retry = RateRetry {
+                last_attempt: Some(fetched_at),
+                consecutive_failures: 0,
+            };
+        }
+        if let Ok(db) = db.lock() {
+            let _ = save_rate_cache(
+                &db,
+                &RateCache {
+                    windows: windows.clone(),
+                    fetched_at,
+                },
+            );
+        }
+        return (
+            windows,
+            "live".into(),
+            "live".into(),
+            fetched_at.to_rfc3339(),
+        );
+    }
+
+    let now = Local::now();
+    if let Ok(mut state) = state.lock() {
+        state.retry.consecutive_failures = state.retry.consecutive_failures.saturating_add(1);
+        state.retry.last_attempt = Some(now);
+        return cached_rate_response(&state, now).unwrap_or_else(rate_unavailable);
+    }
+    rate_unavailable()
+}
+
+fn read_rate_limits(
+    state: &Mutex<RateState>,
+    refresh: &Mutex<()>,
+    db: &Mutex<Connection>,
+    mode: RefreshMode,
+) -> (Vec<RateWindow>, String, String, String) {
+    read_rate_limits_with(state, refresh, db, mode, read_rate_limits_uncached)
+}
+
+fn dashboard_snapshot(state: &Store, mode: RefreshMode) -> Snapshot {
+    let sessions = sessions_path();
+    let sessions_exist = sessions.is_dir();
+    let local_usage = {
+        let db = state.db.lock().unwrap();
+        let scan_succeeded = sessions_exist && scan_sessions(&db, &sessions).is_ok();
+        let coverage = token_coverage(sessions_exist, scan_succeeded);
+        if coverage == "unavailable" {
+            LocalTokenUsage {
+                today: 0,
+                last7: 0,
+                last30: 0,
+                daily: Vec::new(),
+                coverage: coverage.into(),
+            }
+        } else {
+            LocalTokenUsage {
+                today: sums(&db, 1).unwrap_or(0),
+                last7: sums(&db, 7).unwrap_or(0),
+                last30: sums(&db, 30).unwrap_or(0),
+                daily: series(&db).unwrap_or_default(),
+                coverage: coverage.into(),
+            }
+        }
+    };
+    let tokens = select_token_snapshot(
+        read_account_usage(
+            &state.account_usage_cache,
+            &state.account_usage_refresh,
+            mode,
+        ),
+        local_usage,
+        Local::now().date_naive(),
+    );
     let expanded = *state.expanded.lock().unwrap();
-    let (windows, status, freshness, rate_updated_at) = read_rate_limits(&state.rate_cache);
+    let (windows, status, freshness, rate_updated_at) =
+        read_rate_limits(&state.rate_state, &state.rate_refresh, &state.db, mode);
     Snapshot {
         expanded,
-        today,
-        last7,
-        last30,
-        daily,
+        today: tokens.today,
+        last7: tokens.last7,
+        last30: tokens.last30,
+        daily: tokens.daily,
         windows,
-        account: query_account_status(&state.account_cache),
+        account: query_account_status(&state.account_cache, &state.account_refresh, mode),
         rate_status: status,
         rate_freshness: freshness,
-        token_coverage: token_coverage.into(),
-        usage_source,
-        today_available,
+        token_coverage: tokens.token_coverage,
+        usage_source: tokens.usage_source,
+        today_available: tokens.today_available,
         updated_at: if rate_updated_at.is_empty() {
             Local::now().to_rfc3339()
         } else {
             rate_updated_at
         },
     }
+}
+
+#[tauri::command]
+fn get_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
+    dashboard_snapshot(&state, RefreshMode::Cached)
+}
+
+#[tauri::command]
+fn refresh_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
+    dashboard_snapshot(&state, RefreshMode::Force)
 }
 #[tauri::command]
 fn clear_token_history(state: tauri::State<Store>) -> Result<(), String> {
@@ -945,12 +1534,23 @@ fn start_fullscreen_monitor(app: tauri::AppHandle) {
                 }
             }
             if let Some(window) = app.get_webview_window("float") {
-                if fullscreen && !hidden {
-                    let _ = window.hide();
-                    hidden = true;
-                } else if !fullscreen && hidden {
-                    let _ = window.show();
-                    hidden = false;
+                let user_hidden = app
+                    .state::<Store>()
+                    .user_hidden
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(true);
+                let (next_hidden, action) =
+                    fullscreen_visibility_transition(fullscreen, user_hidden, hidden);
+                hidden = next_hidden;
+                match action {
+                    VisibilityAction::Hide => {
+                        let _ = window.hide();
+                    }
+                    VisibilityAction::Show => {
+                        let _ = window.show();
+                    }
+                    VisibilityAction::None => {}
                 }
             }
             thread::sleep(Duration::from_millis(500));
@@ -1018,10 +1618,19 @@ pub fn run() {
                             }
                         }
                         "show-float" => {
+                            let state = app.state::<Store>();
+                            if let Ok(mut hidden) = state.user_hidden.lock() {
+                                *hidden = false;
+                            }
+                            if let Ok(mut enabled) = state.click_through.lock() {
+                                *enabled = false;
+                            }
                             if let Some(window) = app.get_webview_window("float") {
+                                let _ = window.set_ignore_cursor_events(false);
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
+                            let _ = app.emit("click-through-changed", false);
                         }
                         "quit" => app.exit(0),
                         _ => {}
@@ -1080,11 +1689,19 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                if window.label() == "float" {
+                    use tauri::Manager;
+                    let state = window.app_handle().state::<Store>();
+                    if let Ok(mut hidden) = state.user_hidden.lock() {
+                        *hidden = true;
+                    };
+                }
                 let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_dashboard_snapshot,
+            refresh_dashboard_snapshot,
             set_window_expanded,
             save_window_position,
             clear_token_history
@@ -1121,16 +1738,34 @@ mod tests {
     fn line_at(total: i64, inc: i64, timestamp: &str) -> String {
         serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total},"last_token_usage":{"total_tokens":inc}}}}).to_string()
     }
+
+    fn live_window() -> RateWindow {
+        RateWindow {
+            label: "5 小时".into(),
+            used_percent: Some(20.0),
+            remaining_percent: Some(80.0),
+            resets_at: None,
+            window_minutes: Some(300),
+        }
+    }
+
+    fn point(day: &str, tokens: i64) -> DailyPoint {
+        DailyPoint {
+            day: day.into(),
+            tokens,
+        }
+    }
     #[test]
     fn aggregation_uses_cumulative_total_not_last_snapshot_field() {
         let d = tempdir().unwrap();
         let p = d.path().join("a.jsonl");
+        let event_day = Local::now().date_naive().to_string();
         fs::write(
             &p,
             format!(
                 "{}\n{}\n",
-                line_at(100, 100, "2026-08-10T10:00:00Z"),
-                line_at(150, 999, "2026-08-10T10:01:00Z")
+                line_at(100, 100, &format!("{event_day}T10:00:00Z")),
+                line_at(150, 999, &format!("{event_day}T10:01:00Z"))
             ),
         )
         .unwrap();
@@ -1200,6 +1835,21 @@ mod tests {
             .unwrap();
         assert!(!stored_file_id.contains("private-session"));
     }
+
+    #[test]
+    fn sessions_path_prefers_custom_codex_home_and_reports_unavailable_sources() {
+        let codex_home = PathBuf::from("D:/custom-codex");
+        let user_profile = PathBuf::from("D:/users/tester");
+        let home = PathBuf::from("D:/home/tester");
+        assert_eq!(
+            sessions_path_from(Some(&codex_home), Some(&user_profile), Some(&home)),
+            codex_home.join("sessions")
+        );
+        assert_eq!(token_coverage(false, true), "unavailable");
+        assert_eq!(token_coverage(true, false), "unavailable");
+        assert_eq!(token_coverage(true, true), "partial");
+    }
+
     #[test]
     fn cleanup_removes_only_data_older_than_thirty_days() {
         let c = db();
@@ -1234,23 +1884,440 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_stale_until_ten_minutes() {
+    fn cache_is_available_until_fifteen_minutes() {
         let now = Local::now();
         let cached = RateCache {
             windows: vec![RateWindow::default()],
-            fetched_at: now - chrono::Duration::seconds(RATE_CACHE_MAX_AGE_SECS),
+            fetched_at: now - chrono::Duration::seconds(RATE_CACHE_MAX_AGE_SECS - 1),
         };
         assert!(cached_rate_limits(Some(&cached), now).is_some());
     }
 
     #[test]
-    fn cache_expires_after_ten_minutes() {
+    fn cache_expires_after_fifteen_minutes() {
         let now = Local::now();
         let cached = RateCache {
             windows: vec![RateWindow::default()],
             fetched_at: now - chrono::Duration::seconds(RATE_CACHE_MAX_AGE_SECS + 1),
         };
         assert!(cached_rate_limits(Some(&cached), now).is_none());
+    }
+
+    #[test]
+    fn rate_cache_status_changes_after_three_and_fifteen_minutes() {
+        let now = Local::now();
+        let cache_with_age = |seconds| RateCache {
+            windows: vec![RateWindow::default()],
+            fetched_at: now - chrono::Duration::seconds(seconds),
+        };
+        assert_eq!(
+            rate_cache_status(Some(&cache_with_age(0)), now),
+            Some("live")
+        );
+        assert_eq!(
+            rate_cache_status(Some(&cache_with_age(180)), now),
+            Some("stale")
+        );
+        assert_eq!(rate_cache_status(Some(&cache_with_age(901)), now), None);
+    }
+
+    #[test]
+    fn rate_limits_parser_rejects_protocol_errors_and_empty_snapshots() {
+        assert!(parse_rate_limits_response(
+            &serde_json::json!({"id":2,"error":{"code":"unsupported"}})
+        )
+        .is_err());
+        assert!(parse_rate_limits_response(
+            &serde_json::json!({"id":2,"result":{"rateLimits":{}}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rate_limits_parser_keeps_all_windows_and_sorts_by_duration() {
+        let response = serde_json::json!({
+            "id": 2,
+            "result": {"rateLimits": {
+                "primary": {"usedPercent": 50.0, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 10.0, "windowDurationMins": 10080},
+                "tertiary": {"usedPercent": 80.0, "windowDurationMins": 60}
+            }}
+        });
+        let windows = parse_rate_limits_response(&response).unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.window_minutes)
+                .collect::<Vec<_>>(),
+            vec![Some(60), Some(300), Some(10080)]
+        );
+    }
+
+    #[test]
+    fn rate_retry_delay_uses_five_fifteen_then_thirty_seconds() {
+        assert_eq!(rate_retry_delay_secs(0), 0);
+        assert_eq!(rate_retry_delay_secs(1), 5);
+        assert_eq!(rate_retry_delay_secs(2), 15);
+        assert_eq!(rate_retry_delay_secs(3), 30);
+        assert_eq!(rate_retry_delay_secs(4), 30);
+    }
+
+    #[test]
+    fn normalized_rate_cache_survives_database_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        let cache = RateCache {
+            windows: vec![RateWindow {
+                label: "5 小时".into(),
+                used_percent: Some(25.0),
+                remaining_percent: Some(75.0),
+                resets_at: Some(1_900_000_000),
+                window_minutes: Some(300),
+            }],
+            fetched_at: Local::now(),
+        };
+        {
+            let c = Connection::open(&path).unwrap();
+            init(&c).unwrap();
+            save_rate_cache(&c, &cache).unwrap();
+        }
+        let c = Connection::open(&path).unwrap();
+        init(&c).unwrap();
+        let loaded = load_rate_cache(&c).unwrap();
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows[0].remaining_percent, Some(75.0));
+        assert_eq!(loaded.fetched_at.timestamp(), cache.fetched_at.timestamp());
+    }
+
+    #[test]
+    fn expired_rate_cache_is_removed_from_memory_and_database() {
+        let now = Local::now();
+        let cache = RateCache {
+            windows: vec![RateWindow::default()],
+            fetched_at: now - chrono::Duration::seconds(RATE_CACHE_MAX_AGE_SECS + 1),
+        };
+        let c = db();
+        save_rate_cache(&c, &cache).unwrap();
+        let state = Mutex::new(RateState {
+            cache: Some(cache),
+            retry: RateRetry::default(),
+        });
+        let db = Mutex::new(c);
+
+        discard_expired_rate_cache(&state, &db, now);
+
+        assert!(state.lock().unwrap().cache.is_none());
+        let remaining: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM quota_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn concurrent_forced_rate_refreshes_share_one_provider_call() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let state = Arc::new(Mutex::new(RateState {
+            cache: None,
+            retry: RateRetry::default(),
+        }));
+        let refresh = Arc::new(Mutex::new(()));
+        let db = Arc::new(Mutex::new(db()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let state = Arc::clone(&state);
+            let refresh = Arc::clone(&refresh);
+            let db = Arc::clone(&db);
+            let calls = Arc::clone(&calls);
+            workers.push(std::thread::spawn(move || {
+                read_rate_limits_with(&state, &refresh, &db, RefreshMode::Force, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(80));
+                    (vec![live_window()], "live".into())
+                })
+            }));
+        }
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().1, "live");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn forced_rate_refresh_ignores_a_fresh_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Mutex::new(RateState {
+            cache: Some(RateCache {
+                windows: vec![live_window()],
+                fetched_at: Local::now(),
+            }),
+            retry: RateRetry::default(),
+        });
+        let refresh = Mutex::new(());
+        let db = Mutex::new(db());
+        let calls = AtomicUsize::new(0);
+
+        let (_, status, _, _) =
+            read_rate_limits_with(&state, &refresh, &db, RefreshMode::Force, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (vec![live_window()], "live".into())
+            });
+
+        assert_eq!(status, "live");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn forced_rate_refresh_bypasses_retry_delay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Mutex::new(RateState {
+            cache: None,
+            retry: RateRetry {
+                last_attempt: Some(Local::now()),
+                consecutive_failures: 3,
+            },
+        });
+        let refresh = Mutex::new(());
+        let db = Mutex::new(db());
+        let calls = AtomicUsize::new(0);
+
+        let (_, status, _, _) =
+            read_rate_limits_with(&state, &refresh, &db, RefreshMode::Force, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (vec![live_window()], "live".into())
+            });
+
+        assert_eq!(status, "live");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn forced_account_status_preserves_the_last_success_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let previous = AccountStatus {
+            bound: true,
+            plan_type: Some("Plus".into()),
+            subscription_active_until: Some("2099-01-01T00:00:00Z".into()),
+            subscription_state: "active".into(),
+            subscription_error: None,
+            checked_at: Some("2098-01-01T00:00:00Z".into()),
+        };
+        let cache = Mutex::new(Some(AccountCache {
+            cache_key: "account".into(),
+            status: previous,
+            fetched_at: Local::now(),
+        }));
+        let refresh = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let status =
+            read_account_status_with(&cache, &refresh, "account", RefreshMode::Force, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("network unavailable".into())
+            });
+
+        assert!(status.bound);
+        assert_eq!(status.plan_type.as_deref(), Some("Plus"));
+        assert_eq!(
+            status.subscription_error.as_deref(),
+            Some("network unavailable")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_account_status_reuses_a_fresh_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Mutex::new(Some(AccountCache {
+            cache_key: "account".into(),
+            status: AccountStatus {
+                bound: true,
+                plan_type: Some("Plus".into()),
+                subscription_active_until: None,
+                subscription_state: "unknown".into(),
+                subscription_error: None,
+                checked_at: None,
+            },
+            fetched_at: Local::now(),
+        }));
+        let refresh = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let status =
+            read_account_status_with(&cache, &refresh, "account", RefreshMode::Cached, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AccountStatus::default())
+            });
+
+        assert_eq!(status.plan_type.as_deref(), Some("Plus"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn forced_account_usage_ignores_a_fresh_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Mutex::new(Some(AccountUsageCache {
+            daily: vec![point("2026-10-09", 10)],
+            fetched_at: Local::now(),
+        }));
+        let refresh = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let daily = read_account_usage_with(&cache, &refresh, RefreshMode::Force, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![point("2026-10-09", 20)])
+        })
+        .unwrap();
+
+        assert_eq!(daily[0].tokens, 20);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_account_usage_reuses_a_fresh_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Mutex::new(Some(AccountUsageCache {
+            daily: vec![point("2026-10-09", 10)],
+            fetched_at: Local::now(),
+        }));
+        let refresh = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let daily = read_account_usage_with(&cache, &refresh, RefreshMode::Cached, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![point("2026-10-09", 20)])
+        })
+        .unwrap();
+
+        assert_eq!(daily[0].tokens, 10);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn concurrent_forced_account_usage_refreshes_share_one_provider_call() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let cache = Arc::new(Mutex::new(None));
+        let refresh = Arc::new(Mutex::new(()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let refresh = Arc::clone(&refresh);
+            let calls = Arc::clone(&calls);
+            workers.push(std::thread::spawn(move || {
+                read_account_usage_with(&cache, &refresh, RefreshMode::Force, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(80));
+                    Some(vec![point("2026-10-09", 20)])
+                })
+            }));
+        }
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap()[0].tokens, 20);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn account_usage_with_today_selects_only_account_totals() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let local = LocalTokenUsage {
+            today: 999,
+            last7: 1_999,
+            last30: 2_999,
+            daily: vec![point("2026-10-09", 999)],
+            coverage: "partial".into(),
+        };
+
+        let selected = select_token_snapshot(
+            Some(vec![point("2026-10-08", 30), point("2026-10-09", 70)]),
+            local,
+            today,
+        );
+
+        assert_eq!(selected.today, 70);
+        assert_eq!(selected.last7, 100);
+        assert_eq!(selected.usage_source, "account");
+        assert_eq!(selected.token_coverage, "account");
+        assert!(selected.today_available);
+    }
+
+    #[test]
+    fn account_history_without_today_never_uses_local_today() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let local = LocalTokenUsage {
+            today: 999,
+            last7: 1_999,
+            last30: 2_999,
+            daily: vec![point("2026-10-09", 999)],
+            coverage: "partial".into(),
+        };
+
+        let selected = select_token_snapshot(Some(vec![point("2026-10-08", 30)]), local, today);
+
+        assert_eq!(selected.today, 0);
+        assert_eq!(selected.last7, 30);
+        assert_eq!(selected.usage_source, "account_history_pending_today");
+        assert_eq!(selected.token_coverage, "account");
+        assert!(!selected.today_available);
+    }
+
+    #[test]
+    fn unavailable_account_usage_falls_back_to_one_local_group() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let local = LocalTokenUsage {
+            today: 999,
+            last7: 1_999,
+            last30: 2_999,
+            daily: vec![point("2026-10-09", 999)],
+            coverage: "partial".into(),
+        };
+
+        let selected = select_token_snapshot(None, local, today);
+
+        assert_eq!(selected.today, 999);
+        assert_eq!(selected.last7, 1_999);
+        assert_eq!(selected.last30, 2_999);
+        assert_eq!(selected.usage_source, "local");
+        assert_eq!(selected.token_coverage, "partial");
+        assert!(selected.today_available);
+    }
+
+    #[test]
+    fn unavailable_local_usage_marks_today_unavailable() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let selected = select_token_snapshot(
+            None,
+            LocalTokenUsage {
+                today: 0,
+                last7: 0,
+                last30: 0,
+                daily: Vec::new(),
+                coverage: "unavailable".into(),
+            },
+            today,
+        );
+
+        assert_eq!(selected.usage_source, "local");
+        assert_eq!(selected.token_coverage, "unavailable");
+        assert!(!selected.today_available);
     }
 
     #[test]
@@ -1272,6 +2339,47 @@ mod tests {
     }
 
     #[test]
+    fn account_status_serialization_never_exposes_email() {
+        let value = serde_json::to_value(AccountStatus::default()).unwrap();
+        assert!(value.get("email").is_none());
+    }
+
+    #[test]
+    fn account_claims_keep_plan_and_subscription_date_separate() {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "2026-10-01T00:00:00Z",
+                "chatgpt_subscription_active_until": "2026-10-01T00:00:00Z"
+            }
+        });
+        assert_eq!(auth_plan_type(&payload), None);
+        assert_eq!(
+            auth_subscription_active_until(&payload),
+            Some("2026-10-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn fullscreen_visibility_preserves_user_visibility_choice() {
+        assert_eq!(
+            fullscreen_visibility_transition(true, false, false),
+            (true, VisibilityAction::Hide)
+        );
+        assert_eq!(
+            fullscreen_visibility_transition(false, true, true),
+            (false, VisibilityAction::None)
+        );
+        assert_eq!(
+            fullscreen_visibility_transition(false, false, true),
+            (false, VisibilityAction::Show)
+        );
+        assert_eq!(
+            fullscreen_visibility_transition(true, true, false),
+            (false, VisibilityAction::None)
+        );
+    }
+
+    #[test]
     fn jwt_payload_decoder_rejects_malformed_tokens() {
         assert!(decode_jwt_payload("not-a-jwt").is_none());
         assert!(decode_jwt_payload("a.b.c").is_none());
@@ -1289,11 +2397,97 @@ mod tests {
         .unwrap();
         c.execute("INSERT INTO events(event_id,file_id,event_offset,total_tokens,delta_tokens,day) VALUES('e','id',0,1,1,'2026-01-01')", []).unwrap();
         clear_token_data(&c).unwrap();
-        for table in ["daily", "events", "cursors"] {
+        for table in ["daily", "events"] {
             let count: i64 = c
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, 0, "table {table} not cleared");
         }
+        let cursors: i64 = c
+            .query_row("SELECT COUNT(*) FROM cursors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cursors, 1, "scan baselines must survive a statistics clear");
+    }
+
+    #[test]
+    fn clearing_statistics_only_counts_tokens_added_after_the_clear() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        fs::write(&path, format!("{}\n", line(100, 100))).unwrap();
+        let c = db();
+        scan_sessions(&c, dir.path()).unwrap();
+        assert_eq!(sums(&c, 1).unwrap(), 100);
+
+        clear_token_data(&c).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{}\n", line(150, 50)).as_bytes())
+            .unwrap();
+        scan_sessions(&c, dir.path()).unwrap();
+
+        assert_eq!(sums(&c, 1).unwrap(), 50);
+    }
+
+    #[test]
+    fn session_scan_does_not_retain_data_older_than_thirty_days() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.jsonl");
+        let old_day = (Local::now().date_naive() - chrono::Days::new(40)).to_string();
+        fs::write(
+            &path,
+            format!("{}\n", line_at(12, 12, &format!("{old_day}T10:00:00Z"))),
+        )
+        .unwrap();
+        let c = db();
+
+        scan_sessions(&c, dir.path()).unwrap();
+
+        let daily_count: i64 = c
+            .query_row("SELECT COUNT(*) FROM daily", [], |row| row.get(0))
+            .unwrap();
+        let event_count: i64 = c
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(daily_count, 0);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn session_scan_retries_an_incomplete_trailing_json_line() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let complete = line(20, 20);
+        let split = 12;
+        fs::write(&path, format!("{}\n{}", line(10, 10), &complete[..split])).unwrap();
+        let c = db();
+        scan_file(&c, &path).unwrap();
+        assert_eq!(sums(&c, 1).unwrap(), 10);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{}\n", &complete[split..]).as_bytes())
+            .unwrap();
+        scan_file(&c, &path).unwrap();
+
+        assert_eq!(sums(&c, 1).unwrap(), 20);
+    }
+
+    #[test]
+    fn session_scan_rebuilds_a_truncated_file_without_double_counting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        fs::write(&path, format!("{}\n", line(100, 100))).unwrap();
+        let c = db();
+        scan_file(&c, &path).unwrap();
+        assert_eq!(sums(&c, 1).unwrap(), 100);
+
+        fs::write(&path, format!("{}\n", line(7, 7))).unwrap();
+        scan_file(&c, &path).unwrap();
+
+        assert_eq!(sums(&c, 1).unwrap(), 7);
     }
 }
