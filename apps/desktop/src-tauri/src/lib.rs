@@ -1,11 +1,10 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Local, Utc};
-use rusqlite::{params, Connection};
-use serde::Deserialize;
+use rusqlite::Connection;
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{mpsc, Mutex},
     thread,
@@ -16,54 +15,15 @@ mod models;
 mod paths;
 mod state;
 mod storage;
+mod token;
 
 pub use models::{AccountStatus, DailyPoint, RateWindow, Snapshot};
+pub use token::scan_sessions;
 
 use crate::{
-    paths::{auth_file_path, sessions_path},
+    paths::auth_file_path,
     state::{AccountCache, AccountUsageCache, RateCache, RateRetry, RateState, RefreshMode, Store},
-    storage::{cleanup_old_daily, digest, series, sums},
 };
-
-#[derive(Debug, Deserialize)]
-struct TokenInfo {
-    total_token_usage: Option<TotalUsage>,
-}
-#[derive(Debug, Deserialize)]
-struct TotalUsage {
-    total_tokens: Option<i64>,
-}
-#[derive(Debug, Deserialize)]
-struct LinePayload {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    info: Option<TokenInfo>,
-}
-#[derive(Debug, Deserialize)]
-struct EventLine {
-    timestamp: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    payload: Option<LinePayload>,
-}
-
-struct LocalTokenUsage {
-    today: i64,
-    last7: i64,
-    last30: i64,
-    daily: Vec<DailyPoint>,
-    coverage: String,
-}
-
-struct TokenSnapshot {
-    today: i64,
-    last7: i64,
-    last30: i64,
-    daily: Vec<DailyPoint>,
-    token_coverage: String,
-    usage_source: String,
-    today_available: bool,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisibilityAction {
@@ -90,166 +50,10 @@ fn fullscreen_visibility_transition(
     }
 }
 
-fn file_id(path: &Path) -> String {
-    digest(&path.to_string_lossy())
-}
-fn remove_file_events(c: &Connection, id: &str) -> rusqlite::Result<()> {
-    let contributions = {
-        let mut statement =
-            c.prepare("SELECT day, SUM(delta_tokens) FROM events WHERE file_id=? GROUP BY day")?;
-        let rows = statement
-            .query_map([id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    for (day, tokens) in contributions {
-        c.execute(
-            "UPDATE daily SET tokens=MAX(0,tokens-?) WHERE day=?",
-            params![tokens, day],
-        )?;
-        c.execute("DELETE FROM daily WHERE day=? AND tokens=0", [&day])?;
-    }
-    c.execute("DELETE FROM events WHERE file_id=?", [id])?;
-    Ok(())
-}
-fn scan_file(c: &Connection, path: &Path) -> rusqlite::Result<usize> {
-    let id = file_id(path);
-    let current_len = match fs::metadata(path) {
-        Ok(metadata) => metadata.len() as i64,
-        Err(_) => return Ok(0),
-    };
-    let (_old_hash, old_offset, last_total): (Option<String>, i64, i64) = c
-        .query_row(
-            "SELECT file_hash,offset,last_total FROM cursors WHERE file_id=?",
-            [&id],
-            |r| Ok((Some(r.get(0)?), r.get(1)?, r.get(2)?)),
-        )
-        .unwrap_or((None, 0, 0));
-    let truncated = old_offset > current_len;
-    if truncated {
-        remove_file_events(c, &id)?;
-    }
-    let start = if truncated { 0 } else { old_offset };
-    let f =
-        fs::File::open(path).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let mut reader = BufReader::new(f);
-    reader
-        .seek_relative(start)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let mut offset = start;
-    let mut previous = if start > 0 { last_total } else { 0 };
-    let mut count = 0;
-    loop {
-        let at = offset;
-        let mut line = Vec::new();
-        let bytes = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        if bytes == 0 {
-            break;
-        }
-        let complete_line = line.last() == Some(&b'\n');
-        if complete_line {
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-        }
-        let parsed = serde_json::from_slice::<EventLine>(&line);
-        if parsed.is_err() && !complete_line {
-            break;
-        }
-        offset += bytes as i64;
-        let Ok(ev) = parsed else {
-            continue;
-        };
-        if ev.kind.as_deref() != Some("event_msg") {
-            continue;
-        }
-        let event_day = ev
-            .timestamp
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Local).date_naive().to_string())
-            .unwrap_or_else(|| Local::now().date_naive().to_string());
-        let Some(p) = ev.payload else { continue };
-        if p.kind.as_deref() != Some("token_count") {
-            continue;
-        }
-        let Some(info) = p.info else { continue };
-        let Some(total) = info.total_token_usage.and_then(|x| x.total_tokens) else {
-            continue;
-        };
-        let delta = if total == previous {
-            0
-        } else if total < previous {
-            total.max(0)
-        } else {
-            (total - previous).max(0)
-        };
-        previous = total;
-        let day = event_day;
-        let eid = digest(&format!("{id}:{at}:{total}"));
-        let inserted=c.execute("INSERT OR IGNORE INTO events(event_id,file_id,event_offset,total_tokens,delta_tokens,day) VALUES(?,?,?,?,?,?)",params![eid,id,at,total,delta,day])?;
-        if inserted > 0 && delta > 0 {
-            c.execute("INSERT INTO daily(day,tokens) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET tokens=tokens+excluded.tokens",params![day,delta])?;
-            count += 1;
-        }
-    }
-    c.execute("INSERT INTO cursors(file_id,file_hash,offset,last_total) VALUES(?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET file_hash=excluded.file_hash,offset=excluded.offset,last_total=excluded.last_total",params![id,id,offset,previous])?;
-    Ok(count)
-}
-pub fn scan_sessions(c: &Connection, root: &Path) -> rusqlite::Result<usize> {
-    if !root.is_dir() {
-        return Ok(0);
-    }
-    c.execute_batch("BEGIN IMMEDIATE")?;
-    let mut n = 0;
-    fn walk(c: &Connection, p: &Path, n: &mut usize) -> rusqlite::Result<()> {
-        for e in
-            fs::read_dir(p).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-        {
-            let p = e
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                .path();
-            if p.is_dir() {
-                walk(c, &p, n)?
-            } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                *n += scan_file(c, &p)?;
-            }
-        }
-        Ok(())
-    }
-    let result = walk(c, root, &mut n).and_then(|()| {
-        cleanup_old_daily(c, 30)?;
-        Ok(n)
-    });
-    match result {
-        Ok(count) => {
-            c.execute_batch("COMMIT")?;
-            Ok(count)
-        }
-        Err(error) => {
-            let _ = c.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
-}
-
 const SUBSCRIPTION_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const SUBSCRIPTIONS_URL: &str = "https://chatgpt.com/backend-api/subscriptions";
 const ACCOUNT_CACHE_MAX_AGE_SECS: i64 = 30 * 60;
 const ACCOUNT_USAGE_CACHE_MAX_AGE_SECS: i64 = 120;
-
-fn token_coverage(root_exists: bool, scan_succeeded: bool) -> &'static str {
-    if root_exists && scan_succeeded {
-        "partial"
-    } else {
-        "unavailable"
-    }
-}
 
 fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     let part = token.split('.').nth(1)?;
@@ -577,7 +381,7 @@ fn query_account_status(
         Err(error) => return account_status_fallback(cache, None, false, error),
     };
     let cache_identity = account_id.as_deref().unwrap_or(&access);
-    let cache_key = digest(cache_identity);
+    let cache_key = storage::digest(cache_identity);
     let fetch_account_id = account_id.clone();
     read_account_status_with(cache, refresh, &cache_key, mode, move || {
         fetch_account_status(
@@ -878,93 +682,6 @@ fn read_account_usage(
     read_account_usage_with(cache, refresh, mode, read_account_usage_uncached)
 }
 
-fn usage_totals(daily: &[DailyPoint], today: chrono::NaiveDate) -> (i64, i64, i64, bool) {
-    let today_key = today.to_string();
-    let today_available = daily.iter().any(|point| point.day == today_key);
-    let today_value = daily
-        .iter()
-        .filter(|p| p.day == today_key)
-        .map(|p| p.tokens)
-        .sum();
-    let since7 = (today - chrono::Days::new(6)).to_string();
-    let since30 = (today - chrono::Days::new(29)).to_string();
-    let last7 = daily
-        .iter()
-        .filter(|p| p.day >= since7 && p.day <= today_key)
-        .map(|p| p.tokens)
-        .sum();
-    let last30 = daily
-        .iter()
-        .filter(|p| p.day >= since30 && p.day <= today_key)
-        .map(|p| p.tokens)
-        .sum();
-    (today_value, last7, last30, today_available)
-}
-
-fn account_history_with_local_today(
-    account_daily: Vec<DailyPoint>,
-    local_today: i64,
-    today: chrono::NaiveDate,
-) -> Vec<DailyPoint> {
-    let today_key = today.to_string();
-    let mut merged: Vec<DailyPoint> = account_daily
-        .into_iter()
-        .filter(|point| point.day.as_str() < today_key.as_str())
-        .collect();
-    merged.push(DailyPoint {
-        day: today_key,
-        tokens: local_today,
-    });
-    merged.sort_by(|left, right| left.day.cmp(&right.day));
-    merged
-}
-
-fn select_token_snapshot(
-    account_daily: Option<Vec<DailyPoint>>,
-    local: LocalTokenUsage,
-    today: chrono::NaiveDate,
-) -> TokenSnapshot {
-    if let Some(daily) = account_daily.filter(|daily| !daily.is_empty()) {
-        let (today_tokens, last7, last30, today_available) = usage_totals(&daily, today);
-        if local.coverage != "unavailable" {
-            let daily = account_history_with_local_today(daily, local.today, today);
-            let (today, last7, last30, _) = usage_totals(&daily, today);
-            return TokenSnapshot {
-                today,
-                last7,
-                last30,
-                daily,
-                token_coverage: "account_history_local_today".into(),
-                usage_source: "account_history_local_today".into(),
-                today_available: true,
-            };
-        }
-        return TokenSnapshot {
-            today: today_available.then_some(today_tokens).unwrap_or(0),
-            last7,
-            last30,
-            daily,
-            token_coverage: "account".into(),
-            usage_source: if today_available {
-                "account".into()
-            } else {
-                "account_history_today_unavailable".into()
-            },
-            today_available,
-        };
-    }
-    let today_available = local.coverage != "unavailable";
-    TokenSnapshot {
-        today: local.today,
-        last7: local.last7,
-        last30: local.last30,
-        daily: local.daily,
-        token_coverage: local.coverage,
-        usage_source: "local".into(),
-        today_available,
-    }
-}
-
 const RATE_REFRESH_INTERVAL_SECS: i64 = 120;
 const RATE_LIVE_MAX_AGE_SECS: i64 = 180;
 const RATE_CACHE_MAX_AGE_SECS: i64 = 15 * 60;
@@ -1166,31 +883,8 @@ fn read_rate_limits(
 }
 
 fn dashboard_snapshot(state: &Store, mode: RefreshMode) -> Snapshot {
-    let sessions = sessions_path();
-    let sessions_exist = sessions.is_dir();
-    let local_usage = {
-        let db = state.db.lock().unwrap();
-        let scan_succeeded = sessions_exist && scan_sessions(&db, &sessions).is_ok();
-        let coverage = token_coverage(sessions_exist, scan_succeeded);
-        if coverage == "unavailable" {
-            LocalTokenUsage {
-                today: 0,
-                last7: 0,
-                last30: 0,
-                daily: Vec::new(),
-                coverage: coverage.into(),
-            }
-        } else {
-            LocalTokenUsage {
-                today: sums(&db, 1).unwrap_or(0),
-                last7: sums(&db, 7).unwrap_or(0),
-                last30: sums(&db, 30).unwrap_or(0),
-                daily: series(&db).unwrap_or_default(),
-                coverage: coverage.into(),
-            }
-        }
-    };
-    let tokens = select_token_snapshot(
+    let local_usage = token::read_local_usage(state);
+    let tokens = token::select_token_snapshot(
         read_account_usage(
             &state.account_usage_cache,
             &state.account_usage_refresh,
@@ -1234,8 +928,7 @@ fn refresh_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
 }
 #[tauri::command]
 fn clear_token_history(state: tauri::State<Store>) -> Result<(), String> {
-    let db = state.db.lock().map_err(|_| "database lock")?;
-    storage::clear_token_data(&db).map_err(|e| e.to_string())
+    token::clear_history(&state)
 }
 #[tauri::command]
 fn save_window_position(state: tauri::State<Store>, x: i32, y: i32) -> Result<(), String> {
@@ -1493,7 +1186,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::clear_token_data;
+    use crate::{
+        storage::{clear_token_data, sums},
+        token::{scan_file, select_token_snapshot, token_coverage, LocalTokenUsage},
+    };
     use tempfile::tempdir;
 
     #[test]

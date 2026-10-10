@@ -97,6 +97,102 @@ pub(crate) fn digest(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub(crate) struct SessionEvent {
+    pub(crate) event_id: String,
+    pub(crate) file_id: String,
+    pub(crate) event_offset: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) delta_tokens: i64,
+    pub(crate) day: String,
+}
+
+pub(crate) fn load_cursor(db: &Connection, file_id: &str) -> (i64, i64) {
+    db.query_row(
+        "SELECT offset,last_total FROM cursors WHERE file_id=?",
+        [file_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or((0, 0))
+}
+
+pub(crate) fn remove_file_events(db: &Connection, file_id: &str) -> rusqlite::Result<()> {
+    let contributions = {
+        let mut statement =
+            db.prepare("SELECT day, SUM(delta_tokens) FROM events WHERE file_id=? GROUP BY day")?;
+        let rows = statement
+            .query_map([file_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (day, tokens) in contributions {
+        db.execute(
+            "UPDATE daily SET tokens=MAX(0,tokens-?) WHERE day=?",
+            params![tokens, day],
+        )?;
+        db.execute("DELETE FROM daily WHERE day=? AND tokens=0", [&day])?;
+    }
+    db.execute("DELETE FROM events WHERE file_id=?", [file_id])?;
+    Ok(())
+}
+
+pub(crate) fn record_session_event(
+    db: &Connection,
+    event: &SessionEvent,
+) -> rusqlite::Result<bool> {
+    let inserted = db.execute(
+        "INSERT OR IGNORE INTO events(event_id,file_id,event_offset,total_tokens,delta_tokens,day) VALUES(?,?,?,?,?,?)",
+        params![
+            &event.event_id,
+            &event.file_id,
+            event.event_offset,
+            event.total_tokens,
+            event.delta_tokens,
+            &event.day
+        ],
+    )?;
+    if inserted > 0 && event.delta_tokens > 0 {
+        db.execute(
+            "INSERT INTO daily(day,tokens) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET tokens=tokens+excluded.tokens",
+            params![&event.day, event.delta_tokens],
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub(crate) fn save_cursor(
+    db: &Connection,
+    file_id: &str,
+    file_hash: &str,
+    offset: i64,
+    last_total: i64,
+) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT INTO cursors(file_id,file_hash,offset,last_total) VALUES(?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET file_hash=excluded.file_hash,offset=excluded.offset,last_total=excluded.last_total",
+        params![file_id, file_hash, offset, last_total],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn with_immediate_transaction<T>(
+    db: &Connection,
+    work: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    db.execute_batch("BEGIN IMMEDIATE")?;
+    match work(db) {
+        Ok(value) => {
+            db.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = db.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn sums(db: &Connection, days: i64) -> rusqlite::Result<i64> {
     let since =
         (Local::now().date_naive() - chrono::Days::new(days.saturating_sub(1) as u64)).to_string();
