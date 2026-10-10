@@ -2,7 +2,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -15,10 +14,16 @@ use std::{
 
 mod models;
 mod paths;
+mod state;
+mod storage;
 
 pub use models::{AccountStatus, DailyPoint, RateWindow, Snapshot};
 
-use crate::paths::{auth_file_path, sessions_path};
+use crate::{
+    paths::{auth_file_path, sessions_path},
+    state::{AccountCache, AccountUsageCache, RateCache, RateRetry, RateState, RefreshMode, Store},
+    storage::{cleanup_old_daily, digest, series, sums},
+};
 
 #[derive(Debug, Deserialize)]
 struct TokenInfo {
@@ -42,41 +47,6 @@ struct EventLine {
     payload: Option<LinePayload>,
 }
 
-#[derive(Debug, Clone)]
-struct AccountCache {
-    cache_key: String,
-    status: AccountStatus,
-    fetched_at: DateTime<Local>,
-}
-
-struct RateCache {
-    windows: Vec<RateWindow>,
-    fetched_at: DateTime<Local>,
-}
-
-#[derive(Default)]
-struct RateRetry {
-    last_attempt: Option<DateTime<Local>>,
-    consecutive_failures: u32,
-}
-
-struct RateState {
-    cache: Option<RateCache>,
-    retry: RateRetry,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefreshMode {
-    Cached,
-    Force,
-}
-
-#[derive(Debug, Clone)]
-struct AccountUsageCache {
-    daily: Vec<DailyPoint>,
-    fetched_at: DateTime<Local>,
-}
-
 struct LocalTokenUsage {
     today: i64,
     last7: i64,
@@ -93,47 +63,6 @@ struct TokenSnapshot {
     token_coverage: String,
     usage_source: String,
     today_available: bool,
-}
-
-pub struct Store {
-    pub db: Mutex<Connection>,
-    pub expanded: Mutex<bool>,
-    pub click_through: Mutex<bool>,
-    user_hidden: Mutex<bool>,
-    rate_state: Mutex<RateState>,
-    rate_refresh: Mutex<()>,
-    account_cache: Mutex<Option<AccountCache>>,
-    account_refresh: Mutex<()>,
-    account_usage_cache: Mutex<Option<AccountUsageCache>>,
-    account_usage_refresh: Mutex<()>,
-}
-impl Store {
-    pub fn new(path: &Path) -> rusqlite::Result<Self> {
-        let c = Connection::open(path)?;
-        init(&c)?;
-        let expanded = c
-            .query_row("SELECT expanded FROM window_state WHERE id=1", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|value| value != 0)
-            .unwrap_or(false);
-        let rate_cache = load_rate_cache(&c);
-        Ok(Self {
-            db: Mutex::new(c),
-            expanded: Mutex::new(expanded),
-            click_through: Mutex::new(false),
-            user_hidden: Mutex::new(false),
-            rate_state: Mutex::new(RateState {
-                cache: rate_cache,
-                retry: RateRetry::default(),
-            }),
-            rate_refresh: Mutex::new(()),
-            account_cache: Mutex::new(None),
-            account_refresh: Mutex::new(()),
-            account_usage_cache: Mutex::new(None),
-            account_usage_refresh: Mutex::new(()),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,53 +90,6 @@ fn fullscreen_visibility_transition(
     }
 }
 
-fn init(c: &Connection) -> rusqlite::Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS cursors(file_id TEXT PRIMARY KEY,file_hash TEXT NOT NULL,offset INTEGER NOT NULL,last_total INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY,file_id TEXT NOT NULL,event_offset INTEGER NOT NULL,total_tokens INTEGER NOT NULL,delta_tokens INTEGER NOT NULL,day TEXT NOT NULL); CREATE TABLE IF NOT EXISTS daily(day TEXT PRIMARY KEY,tokens INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS window_state(id INTEGER PRIMARY KEY CHECK(id=1),x INTEGER NOT NULL,y INTEGER NOT NULL,expanded INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS quota_cache(id INTEGER PRIMARY KEY CHECK(id=1),windows_json TEXT NOT NULL,fetched_at TEXT NOT NULL);")
-}
-
-fn load_rate_cache(c: &Connection) -> Option<RateCache> {
-    let (windows_json, fetched_at): (String, String) = c
-        .query_row(
-            "SELECT windows_json,fetched_at FROM quota_cache WHERE id=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok()?;
-    let windows = serde_json::from_str(&windows_json).ok()?;
-    let fetched_at = DateTime::parse_from_rfc3339(&fetched_at)
-        .ok()?
-        .with_timezone(&Local);
-    Some(RateCache {
-        windows,
-        fetched_at,
-    })
-}
-
-fn save_rate_cache(c: &Connection, cache: &RateCache) -> rusqlite::Result<()> {
-    let windows_json = serde_json::to_string(&cache.windows)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    c.execute(
-        "INSERT INTO quota_cache(id,windows_json,fetched_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET windows_json=excluded.windows_json,fetched_at=excluded.fetched_at",
-        params![windows_json, cache.fetched_at.to_rfc3339()],
-    )?;
-    Ok(())
-}
-
-fn cleanup_old_daily(c: &Connection, keep_days: i64) -> rusqlite::Result<usize> {
-    let cutoff = (Local::now().date_naive()
-        - chrono::Days::new(keep_days.saturating_sub(1) as u64))
-    .to_string();
-    c.execute("DELETE FROM events WHERE day < ?", [&cutoff])?;
-    c.execute("DELETE FROM daily WHERE day < ?", [cutoff])
-}
-fn clear_token_data(c: &Connection) -> rusqlite::Result<()> {
-    c.execute_batch("DELETE FROM events; DELETE FROM daily;")
-}
-fn digest(s: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
-}
 fn file_id(path: &Path) -> String {
     digest(&path.to_string_lossy())
 }
@@ -707,34 +589,6 @@ fn query_account_status(
     })
 }
 
-fn sums(c: &Connection, days: i64) -> rusqlite::Result<i64> {
-    let since =
-        (Local::now().date_naive() - chrono::Days::new(days.saturating_sub(1) as u64)).to_string();
-    c.query_row(
-        "SELECT COALESCE(SUM(tokens),0) FROM daily WHERE day>=?",
-        [since],
-        |r| r.get(0),
-    )
-}
-fn series(c: &Connection) -> rusqlite::Result<Vec<DailyPoint>> {
-    let today = Local::now().date_naive();
-    (0..7)
-        .rev()
-        .map(|i| {
-            let d = (today - chrono::Days::new(i)).to_string();
-            c.query_row(
-                "SELECT COALESCE(tokens,0) FROM daily WHERE day=?",
-                [&d],
-                |r| {
-                    Ok(DailyPoint {
-                        day: d.clone(),
-                        tokens: r.get(0)?,
-                    })
-                },
-            )
-        })
-        .collect()
-}
 fn recv_response(
     messages: &mpsc::Receiver<serde_json::Value>,
     id: i64,
@@ -1159,7 +1013,7 @@ fn discard_expired_rate_cache(
     };
     if expired {
         if let Ok(db) = db.lock() {
-            let _ = db.execute("DELETE FROM quota_cache WHERE id=1", []);
+            let _ = storage::delete_rate_cache(&db);
         }
     }
 }
@@ -1283,13 +1137,7 @@ where
             };
         }
         if let Ok(db) = db.lock() {
-            let _ = save_rate_cache(
-                &db,
-                &RateCache {
-                    windows: windows.clone(),
-                    fetched_at,
-                },
-            );
+            let _ = storage::save_rate_cache(&db, &windows, fetched_at);
         }
         return (
             windows,
@@ -1387,14 +1235,13 @@ fn refresh_dashboard_snapshot(state: tauri::State<Store>) -> Snapshot {
 #[tauri::command]
 fn clear_token_history(state: tauri::State<Store>) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "database lock")?;
-    clear_token_data(&db).map_err(|e| e.to_string())
+    storage::clear_token_data(&db).map_err(|e| e.to_string())
 }
 #[tauri::command]
 fn save_window_position(state: tauri::State<Store>, x: i32, y: i32) -> Result<(), String> {
     let db = state.db.lock().map_err(|_| "database lock")?;
     let expanded = *state.expanded.lock().map_err(|_| "lock")?;
-    db.execute("INSERT INTO window_state(id,x,y,expanded) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET x=excluded.x,y=excluded.y,expanded=excluded.expanded", rusqlite::params![x, y, expanded as i64])
-        .map_err(|e| e.to_string())?;
+    storage::save_window_position(&db, x, y, expanded).map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
@@ -1406,8 +1253,7 @@ fn set_window_expanded(
     *state.expanded.lock().map_err(|_| "lock")? = expanded;
     {
         let db = state.db.lock().map_err(|_| "database lock")?;
-        db.execute("INSERT INTO window_state(id,x,y,expanded) VALUES(1,0,0,?) ON CONFLICT(id) DO UPDATE SET expanded=excluded.expanded", [expanded as i64])
-            .map_err(|e| e.to_string())?;
+        storage::save_window_expanded(&db, expanded).map_err(|e| e.to_string())?;
     }
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("float") {
@@ -1433,11 +1279,7 @@ fn set_window_expanded(
                     .map_err(|e| e.to_string())?;
             }
             let db = state.db.lock().map_err(|_| "database lock")?;
-            db.execute(
-                "INSERT INTO window_state(id,x,y,expanded) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET x=excluded.x,y=excluded.y,expanded=excluded.expanded",
-                rusqlite::params![x, y, expanded as i64],
-            )
-            .map_err(|e| e.to_string())?;
+            storage::save_window_position(&db, x, y, expanded).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -1586,20 +1428,11 @@ pub fn run() {
                     .build(app)?;
             }
             let state = app.state::<Store>();
-            let saved = state.db.lock().ok().and_then(|db| {
-                db.query_row(
-                    "SELECT x,y,expanded FROM window_state WHERE id=1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, i32>(0)?,
-                            row.get::<_, i32>(1)?,
-                            row.get::<_, i64>(2)? != 0,
-                        ))
-                    },
-                )
+            let saved = state
+                .db
+                .lock()
                 .ok()
-            });
+                .and_then(|db| storage::load_window_state(&db));
             if let Some(window) = app.get_webview_window("float") {
                 let expanded = saved.as_ref().map(|value| value.2).unwrap_or(false);
                 if expanded {
@@ -1660,6 +1493,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::clear_token_data;
     use tempfile::tempdir;
 
     #[test]
@@ -1677,7 +1511,7 @@ mod tests {
     }
     fn db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        init(&c).unwrap();
+        storage::initialize(&c).unwrap();
         c
     }
     fn line(total: i64, inc: i64) -> String {
@@ -1792,22 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_data_older_than_thirty_days() {
-        let c = db();
-        c.execute("INSERT INTO daily(day,tokens) VALUES('2000-01-01',10)", [])
-            .unwrap();
-        c.execute(
-            "INSERT INTO daily(day,tokens) VALUES(?,20)",
-            [Local::now().date_naive().to_string()],
-        )
-        .unwrap();
-        cleanup_old_daily(&c, 30).unwrap();
-        let count: i64 = c
-            .query_row("SELECT COUNT(*) FROM daily", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-    #[test]
     fn recv_response_filters_by_id() {
         let (sender, receiver) = mpsc::channel();
         sender.send(serde_json::json!({"id": 99})).unwrap();
@@ -1905,33 +1723,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_rate_cache_survives_database_reopen() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("cache.sqlite");
-        let cache = RateCache {
-            windows: vec![RateWindow {
-                label: "5 小时".into(),
-                used_percent: Some(25.0),
-                remaining_percent: Some(75.0),
-                resets_at: Some(1_900_000_000),
-                window_minutes: Some(300),
-            }],
-            fetched_at: Local::now(),
-        };
-        {
-            let c = Connection::open(&path).unwrap();
-            init(&c).unwrap();
-            save_rate_cache(&c, &cache).unwrap();
-        }
-        let c = Connection::open(&path).unwrap();
-        init(&c).unwrap();
-        let loaded = load_rate_cache(&c).unwrap();
-        assert_eq!(loaded.windows.len(), 1);
-        assert_eq!(loaded.windows[0].remaining_percent, Some(75.0));
-        assert_eq!(loaded.fetched_at.timestamp(), cache.fetched_at.timestamp());
-    }
-
-    #[test]
     fn expired_rate_cache_is_removed_from_memory_and_database() {
         let now = Local::now();
         let cache = RateCache {
@@ -1939,7 +1730,7 @@ mod tests {
             fetched_at: now - chrono::Duration::seconds(RATE_CACHE_MAX_AGE_SECS + 1),
         };
         let c = db();
-        save_rate_cache(&c, &cache).unwrap();
+        storage::save_rate_cache(&c, &cache.windows, cache.fetched_at).unwrap();
         let state = Mutex::new(RateState {
             cache: Some(cache),
             retry: RateRetry::default(),
