@@ -1130,6 +1130,24 @@ fn usage_totals(daily: &[DailyPoint], today: chrono::NaiveDate) -> (i64, i64, i6
     (today_value, last7, last30, today_available)
 }
 
+fn account_history_with_local_today(
+    account_daily: Vec<DailyPoint>,
+    local_today: i64,
+    today: chrono::NaiveDate,
+) -> Vec<DailyPoint> {
+    let today_key = today.to_string();
+    let mut merged: Vec<DailyPoint> = account_daily
+        .into_iter()
+        .filter(|point| point.day.as_str() < today_key.as_str())
+        .collect();
+    merged.push(DailyPoint {
+        day: today_key,
+        tokens: local_today,
+    });
+    merged.sort_by(|left, right| left.day.cmp(&right.day));
+    merged
+}
+
 fn select_token_snapshot(
     account_daily: Option<Vec<DailyPoint>>,
     local: LocalTokenUsage,
@@ -1137,6 +1155,19 @@ fn select_token_snapshot(
 ) -> TokenSnapshot {
     if let Some(daily) = account_daily.filter(|daily| !daily.is_empty()) {
         let (today_tokens, last7, last30, today_available) = usage_totals(&daily, today);
+        if local.coverage != "unavailable" {
+            let daily = account_history_with_local_today(daily, local.today, today);
+            let (today, last7, last30, _) = usage_totals(&daily, today);
+            return TokenSnapshot {
+                today,
+                last7,
+                last30,
+                daily,
+                token_coverage: "account_history_local_today".into(),
+                usage_source: "account_history_local_today".into(),
+                today_available: true,
+            };
+        }
         return TokenSnapshot {
             today: today_available.then_some(today_tokens).unwrap_or(0),
             last7,
@@ -1146,7 +1177,7 @@ fn select_token_snapshot(
             usage_source: if today_available {
                 "account".into()
             } else {
-                "account_history_pending_today".into()
+                "account_history_today_unavailable".into()
             },
             today_available,
         };
@@ -2236,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn account_usage_with_today_selects_only_account_totals() {
+    fn account_history_with_local_today_prefers_local_today_and_recalculates_totals() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
         let local = LocalTokenUsage {
             today: 999,
@@ -2252,15 +2283,17 @@ mod tests {
             today,
         );
 
-        assert_eq!(selected.today, 70);
-        assert_eq!(selected.last7, 100);
-        assert_eq!(selected.usage_source, "account");
-        assert_eq!(selected.token_coverage, "account");
+        assert_eq!(selected.today, 999);
+        assert_eq!(selected.last7, 1_029);
+        assert_eq!(selected.last30, 1_029);
+        assert_eq!(selected.daily.last().unwrap().tokens, 999);
+        assert_eq!(selected.usage_source, "account_history_local_today");
+        assert_eq!(selected.token_coverage, "account_history_local_today");
         assert!(selected.today_available);
     }
 
     #[test]
-    fn account_history_without_today_never_uses_local_today() {
+    fn account_history_without_today_uses_local_today() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
         let local = LocalTokenUsage {
             today: 999,
@@ -2272,9 +2305,54 @@ mod tests {
 
         let selected = select_token_snapshot(Some(vec![point("2026-10-08", 30)]), local, today);
 
+        assert_eq!(selected.today, 999);
+        assert_eq!(selected.last7, 1_029);
+        assert_eq!(selected.last30, 1_029);
+        assert_eq!(selected.usage_source, "account_history_local_today");
+        assert_eq!(selected.token_coverage, "account_history_local_today");
+        assert!(selected.today_available);
+    }
+
+    #[test]
+    fn unavailable_local_usage_uses_account_today_when_available() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let selected = select_token_snapshot(
+            Some(vec![point("2026-10-08", 30), point("2026-10-09", 70)]),
+            LocalTokenUsage {
+                today: 0,
+                last7: 0,
+                last30: 0,
+                daily: Vec::new(),
+                coverage: "unavailable".into(),
+            },
+            today,
+        );
+
+        assert_eq!(selected.today, 70);
+        assert_eq!(selected.last7, 100);
+        assert_eq!(selected.usage_source, "account");
+        assert_eq!(selected.token_coverage, "account");
+        assert!(selected.today_available);
+    }
+
+    #[test]
+    fn account_history_without_local_today_marks_today_unavailable() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let selected = select_token_snapshot(
+            Some(vec![point("2026-10-08", 30)]),
+            LocalTokenUsage {
+                today: 0,
+                last7: 0,
+                last30: 0,
+                daily: Vec::new(),
+                coverage: "unavailable".into(),
+            },
+            today,
+        );
+
         assert_eq!(selected.today, 0);
         assert_eq!(selected.last7, 30);
-        assert_eq!(selected.usage_source, "account_history_pending_today");
+        assert_eq!(selected.usage_source, "account_history_today_unavailable");
         assert_eq!(selected.token_coverage, "account");
         assert!(!selected.today_available);
     }
