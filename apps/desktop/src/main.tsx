@@ -6,6 +6,8 @@ import { createRoot } from "react-dom/client";
 import { formatReset, formatResetCountdown, formatTokens, formatWindow, type RateWindow } from "./format";
 import "./style.css";
 
+const SNAPSHOT_REFRESH_INTERVAL_MS = 120_000;
+
 type Snapshot = {
   expanded: boolean;
   today: number;
@@ -23,8 +25,8 @@ type Snapshot = {
   };
   rateStatus: "live" | "stale" | "unavailable";
   rateFreshness: "live" | "stale" | "unavailable";
-  tokenCoverage: "partial" | "unavailable" | "account";
-  usageSource: "account" | "account_history_pending_today" | "local";
+  tokenCoverage: "partial" | "unavailable" | "account" | "account_history_local_today";
+  usageSource: "account" | "account_history_local_today" | "account_history_today_unavailable" | "local";
   todayAvailable: boolean;
   updatedAt: string;
 };
@@ -44,6 +46,23 @@ const fallback: Snapshot = {
   todayAvailable: false,
   updatedAt: "",
 };
+
+function tokenUsageSourceLabel(snapshot: Snapshot) {
+  switch (snapshot.usageSource) {
+    case "account_history_local_today":
+      return "账户历史 · 本机实时今日";
+    case "account_history_today_unavailable":
+      return "账户历史 · 今日本机数据不可用";
+    case "account":
+      return "账户 Token";
+    case "local":
+      return snapshot.tokenCoverage === "partial" ? "本机 Token 用量 · 部分覆盖" : "本机 Token 数据不可用";
+  }
+}
+
+function todayTokenText(snapshot: Snapshot) {
+  return snapshot.todayAvailable ? formatTokens(snapshot.today) : "--";
+}
 
 function FloatApp() {
   const [snapshot, setSnapshot] = useState(fallback);
@@ -76,7 +95,7 @@ function FloatApp() {
 
   useEffect(() => {
     void refresh(false);
-    const timer = window.setInterval(() => void refresh(false), 120_000);
+    const timer = window.setInterval(() => void refresh(false), SNAPSHOT_REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -177,9 +196,9 @@ function FloatApp() {
         </div>
         <div className="token-summary">
           <small>今日 Token</small>
-          <strong>{snapshot.todayAvailable ? formatTokens(snapshot.today) : "待结算"}</strong>
+          <strong>{todayTokenText(snapshot)}</strong>
         </div>
-        <span className={`status-dot ${snapshot.rateFreshness}`} title={`${snapshot.rateFreshness === "live" ? "额度较新" : snapshot.rateFreshness === "stale" ? "额度来自缓存" : "额度不可用"} · ${snapshot.tokenCoverage === "account" ? "账户 Token 日桶" : snapshot.tokenCoverage === "partial" ? "本机 Token 仅部分覆盖" : "本机 Token 数据不可用"}`} />
+        <span className={`status-dot ${snapshot.rateFreshness}`} title={`${snapshot.rateFreshness === "live" ? "额度较新" : snapshot.rateFreshness === "stale" ? "额度来自缓存" : "额度不可用"} · ${tokenUsageSourceLabel(snapshot)}`} />
         <button
           type="button"
           className="toggle-button compact-toggle"
@@ -222,7 +241,7 @@ function FloatApp() {
           </section>
 
           <section className="totals">
-            <div><small>今天</small><strong>{snapshot.todayAvailable ? formatTokens(snapshot.today) : "待结算"}</strong></div>
+            <div><small>今天</small><strong>{todayTokenText(snapshot)}</strong></div>
             <div><small>最近 7 天</small><strong>{formatTokens(snapshot.last7)}</strong></div>
             <div><small>最近 30 天</small><strong>{formatTokens(snapshot.last30)}</strong></div>
           </section>
@@ -236,7 +255,7 @@ function FloatApp() {
           </section>
 
           <footer>
-            <span>{refreshFailed ? "刷新失败" : clickThrough ? "鼠标穿透 · Ctrl+Shift+Space 恢复" : snapshot.usageSource === "account" ? "账户 Token 用量" : snapshot.usageSource === "account_history_pending_today" ? "账户历史用量 · 今日待结算" : snapshot.rateFreshness === "stale" ? "额度缓存 · 本机 Token 部分覆盖" : snapshot.rateFreshness === "unavailable" ? "额度不可用 · 本机 Token 部分覆盖" : snapshot.tokenCoverage === "partial" ? "本机 Token 用量 · 部分覆盖" : "本机 Token 数据不可用"}</span>
+            <span>{refreshFailed ? "刷新失败" : clickThrough ? "鼠标穿透 · Ctrl+Shift+Space 恢复" : tokenUsageSourceLabel(snapshot)}</span>
             <span className="footer-actions">
               {snapshot.updatedAt ? `更新于 ${new Date(snapshot.updatedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}` : "尚未更新"}
               <button type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
@@ -281,7 +300,7 @@ function MainWindow() {
 
   useEffect(() => {
     void refresh(false);
-    const timer = window.setInterval(() => void refresh(false), 120_000);
+    const timer = window.setInterval(() => void refresh(false), SNAPSHOT_REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -311,9 +330,9 @@ function MainWindow() {
         <section className="dashboard-grid">
           <article className="dashboard-card quota-hero"><div className="card-heading"><span>实时额度</span><i className={`live-indicator ${snapshot.rateFreshness}`} /></div><strong>{primary ? `${Math.round(primary.remainingPercent ?? 0)}%` : "--"}</strong><div className="large-progress"><i style={{ width: `${Math.max(0, Math.min(100, primary?.remainingPercent ?? 0))}%` }} /></div><small>{primary?.label ?? "额度暂不可用"} · {primary ? formatReset(primary.resetsAt) : "等待数据"} · {formatResetCountdown(primary?.resetsAt, clock)}</small></article>
           <article className="dashboard-card"><div className="card-heading"><span>订阅到期</span><span className={`badge ${account.subscriptionState}`}>{account.bound ? "已绑定" : "未绑定"}</span></div><strong className="date-value">{subscription}</strong><small>{account.subscriptionError ?? (account.checkedAt ? `最近检查 ${new Date(account.checkedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}` : "等待检查")}</small></article>
-          <article className="dashboard-card"><div className="card-heading"><span>今日 Token</span><span className="muted-label">{snapshot.usageSource === "account" ? "账户 Token" : snapshot.usageSource === "account_history_pending_today" ? "账户历史 · 今日待结算" : "本机回退"}</span></div><strong>{snapshot.todayAvailable ? formatTokens(snapshot.today) : "待结算"}</strong><small>最近 7 天 {formatTokens(snapshot.last7)}</small></article>
+          <article className="dashboard-card"><div className="card-heading"><span>今日 Token</span><span className="muted-label">{tokenUsageSourceLabel(snapshot)}</span></div><strong>{todayTokenText(snapshot)}</strong><small>最近 7 天 {formatTokens(snapshot.last7)}</small></article>
         </section>
-        <section className="dashboard-card usage-card"><div className="section-heading"><div><span className="eyebrow">Usage trend</span><h2>Token 使用趋势</h2></div><span className="muted-label">{snapshot.usageSource === "account" ? "账户日桶" : snapshot.usageSource === "account_history_pending_today" ? "账户历史 · 今日待结算" : snapshot.tokenCoverage === "partial" ? "本机记录 · 部分覆盖" : "本机数据不可用"}</span></div><div className="dashboard-bars">{snapshot.daily.slice(-7).map((point) => { const max = Math.max(...snapshot.daily.map((item) => item.tokens), 1); return <div className="dashboard-bar" key={point.day}><i style={{ height: `${Math.max(8, point.tokens / max * 100)}%` }} /><small>{point.day.slice(5).replace("-", "/")}</small><b>{formatTokens(point.tokens)}</b></div>; })}</div></section>
+        <section className="dashboard-card usage-card"><div className="section-heading"><div><span className="eyebrow">Usage trend</span><h2>Token 使用趋势</h2></div><span className="muted-label">{tokenUsageSourceLabel(snapshot)}</span></div><div className="dashboard-bars">{snapshot.daily.slice(-7).map((point) => { const max = Math.max(...snapshot.daily.map((item) => item.tokens), 1); return <div className="dashboard-bar" key={point.day}><i style={{ height: `${Math.max(8, point.tokens / max * 100)}%` }} /><small>{point.day.slice(5).replace("-", "/")}</small><b>{formatTokens(point.tokens)}</b></div>; })}</div></section>
         <section className="dashboard-card windows-card"><div className="section-heading"><div><span className="eyebrow">Quota windows</span><h2>额度窗口</h2></div><span className={`badge ${snapshot.rateFreshness}`}>{snapshot.rateFreshness === "live" ? "实时" : snapshot.rateFreshness === "stale" ? "缓存" : "不可用"}</span></div><div className="window-list">{snapshot.windows.map((item, index) => <div className="window-row" key={`${item.label}-${index}`}><span>{formatWindow(item)}</span><b>{Math.round(item.remainingPercent ?? 0)}%</b><small>{formatReset(item.resetsAt)}</small></div>)}</div></section>
       </div>
       <div className="dashboard-corner-badge"><i />{refreshFailed ? "刷新失败" : account.bound ? "本机监测已启用" : "等待绑定"}</div>
