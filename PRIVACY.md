@@ -32,4 +32,4 @@ Codex Float retains up to 30 days of daily aggregate Token totals and expires qu
 
 ## Coverage
 
-“Local Token usage” describes usage observable from supported local Codex records. “Account Token usage” is a separate, allow-listed daily aggregate returned by the local Codex runtime when available. Neither is an OpenAI account invoice; either may be delayed or incomplete depending on Codex version and data availability.
+“Local Token usage” describes usage observable from supported local Codex records. The displayed local-day aggregate is rescanned with each two-minute snapshot and replaces, rather than adds to, an account aggregate for the same day. “Account Token usage” is an allow-listed daily aggregate returned by the local Codex runtime and supplies historical daily buckets; its current-day bucket is used only when the local current-day aggregate is unavailable. Neither is an OpenAI account invoice; either may be delayed or incomplete depending on Codex version and data availability.
