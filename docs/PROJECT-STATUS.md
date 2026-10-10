@@ -1,6 +1,6 @@
 # Codex Float 项目状态
 
-**基线日期**：2026-10-09
+**基线日期**：2026-10-10
 **代码基线**：当前 `master` 工作树（本轮 patch 已通过自动化验证）
 **目标平台**：Windows 11 x64  
 **当前阶段**：核心回归修复已通过自动测试与 Debug 构建；Windows 交互实机验收和发布工程仍待完成
@@ -98,7 +98,7 @@ apps/desktop/src-tauri/target/debug/codex-float.exe
 
 ```text
 前端：1 个测试文件，7 个测试通过
-Rust：41 个测试通过
+Rust：43 个测试通过
 Vite/TypeScript：构建成功
 Tauri Windows Debug（--no-bundle）：构建成功
 ```
